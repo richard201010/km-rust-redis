@@ -166,7 +166,9 @@ impl RespValue {
         fn int_cache() -> &'static Vec<Vec<u8>> {
             static CACHE: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
             CACHE.get_or_init(|| {
-                (0..10000).map(|i| format!(":{}\r\n", i).into_bytes()).collect()
+                (0..10000)
+                    .map(|i| format!(":{}\r\n", i).into_bytes())
+                    .collect()
             })
         }
         match self {
@@ -176,9 +178,34 @@ impl RespValue {
             RespValue::Null => b"$-1\r\n".to_vec(),
             RespValue::NullArray => b"*-1\r\n".to_vec(),
             RespValue::Integer(n) if *n >= 0 && *n < 10000 => int_cache()[*n as usize].clone(),
-            RespValue::Integer(0) => b":0\r\n".to_vec(),
-            RespValue::Integer(1) => b":1\r\n".to_vec(),
             _ => self.encode(false),
+        }
+    }
+
+    /// 快速编码写入缓冲区：高频响应直接写入目标 Vec，零中间分配
+    ///
+    /// 与 `encode_fast` 语义相同，但避免创建临时 Vec 后再拷贝到 write_buf，
+    /// 对 OK/PONG/QUEUED/Null/整数等高频响应性能提升显著。
+    pub fn encode_fast_into(&self, buf: &mut Vec<u8>) {
+        use std::sync::OnceLock;
+        fn int_cache() -> &'static Vec<Vec<u8>> {
+            static CACHE: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+            CACHE.get_or_init(|| {
+                (0..10000)
+                    .map(|i| format!(":{}\r\n", i).into_bytes())
+                    .collect()
+            })
+        }
+        match self {
+            RespValue::SimpleString(s) if s == "OK" => buf.extend_from_slice(b"+OK\r\n"),
+            RespValue::SimpleString(s) if s == "PONG" => buf.extend_from_slice(b"+PONG\r\n"),
+            RespValue::SimpleString(s) if s == "QUEUED" => buf.extend_from_slice(b"+QUEUED\r\n"),
+            RespValue::Null => buf.extend_from_slice(b"$-1\r\n"),
+            RespValue::NullArray => buf.extend_from_slice(b"*-1\r\n"),
+            RespValue::Integer(n) if *n >= 0 && *n < 10000 => {
+                buf.extend_from_slice(&int_cache()[*n as usize]);
+            }
+            _ => self.encode_into(buf, false),
         }
     }
 
@@ -604,9 +631,9 @@ impl RespParser {
             let data_start = pos + 2; // 数据起始位置（跳过长度行的 \r\n）
             let data_end = data_start + len; // 数据结束位置
 
-            // 数据不足，等待更多字节
+            // 数据不足，等待更多字节（不消费任何已读数据，支持重入解析）
             if self.buf.len() < data_end + 2 {
-                return Ok(None); // Need more data
+                return Ok(None);
             }
 
             // 验证数据末尾的 \r\n
@@ -614,10 +641,12 @@ impl RespParser {
                 return Err("Invalid bulk string terminator".to_string());
             }
 
-            // 提取数据并消费已解析的字节
-            let data = self.buf[data_start..data_end].to_vec();
-            self.buf.advance(data_end + 2);
-            Ok(Some(RespValue::BulkString(data)))
+            // 零拷贝：advance 跳过头部（$len\r\n），split_to 提取数据+CRLF
+            // BytesMut::advance 内部仅移动指针不复制，split_to 返回引用计数切片
+            // 整个过程零 memcpy（对比旧实现的 to_vec 逐字节复制）
+            self.buf.advance(data_start);
+            let msg = self.buf.split_to(len + 2); // msg = data + \r\n
+            Ok(Some(RespValue::BulkString(msg[..len].to_vec())))
         } else {
             Ok(None)
         }

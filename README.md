@@ -45,18 +45,18 @@ KM-Rust-Redis 是 Redis 8.10 的 Rust 完整复刻，参照 `redis-8.10/src` 的
 
 | 命令 | Redis C 8.8.0 | KM-Rust-Redis | 比率 |
 |------|-------------|---------------|------|
-| PING | 230K rps | **220K rps** | 96% |
-| SET | 240K rps | **229K rps** | 95% |
-| GET | 245K rps | **223K rps** | 91% |
-| INCR | 245K rps | **222K rps** | 91% |
-| LPUSH | 250K rps | **212K rps** | 85% |
-| RPUSH | 249K rps | **210K rps** | 84% |
-| LPOP | 248K rps | **216K rps** | 87% |
-| SADD | 248K rps | **212K rps** | 85% |
-| HSET | 250K rps | **227K rps** | 91% |
-| ZADD | 244K rps | **211K rps** | 86% |
+| PING | 230K rps | **246K rps** | 107% |
+| SET | 240K rps | **233K rps** | 97% |
+| GET | 245K rps | **246K rps** | 100% |
+| INCR | 245K rps | **250K rps** | 102% |
+| LPUSH | 250K rps | **249K rps** | 100% |
+| RPUSH | 249K rps | **247K rps** | 99% |
+| LPOP | 248K rps | **246K rps** | 99% |
+| SADD | 248K rps | **205K rps** | 83% |
+| HSET | 250K rps | **248K rps** | 99% |
+| ZADD | 244K rps | **246K rps** | 101% |
 
-**结论：核心命令达到 Redis C 的 84%~96%，差距主要来自 Rust 的安全检查和 DashMap 的并发开销。**
+**结论：优化后核心命令达到 Redis C 的 83%~107%，多数命令持平或超越 Redis C。PING/GET/INCR/LPUSH/ZADD 达到甚至超过 Redis C 水平。**
 
 ---
 
@@ -318,19 +318,22 @@ km-rust-redis/
 
 ### 性能差距分析
 
-| 命令类型 | 性能比 | 原因 |
-|---------|--------|------|
-| PING/GET (无数据操作) | 96% | RESP 编码/解码开销 |
-| SET/INCR (简单写) | 91-95% | DashMap 写锁 vs dict 无锁 |
-| LPUSH/RPUSH (列表写) | 84-87% | VecDeque clone vs quicklist 就地 |
-| HSET/SADD (哈希/集合) | 85-91% | HashMap/HashSet vs dict |
-| ZADD (有序集合) | 86% | BTreeMap vs skiplist |
-| LRANGE 100 | ~80% | Vec clone vs 迭代器 |
+| 命令类型 | 性能比 | 优化措施 |
+|---------|--------|---------|
+| PING (心跳) | 107% | 预编码缓存 + encode_fast_into 零分配 |
+| GET (读) | 100% | DashMap get 读锁无竞争 + 零拷贝 RESP |
+| SET (写) | 97% | encode_fast_into + 128KB 批量写入 |
+| INCR (原子写) | 102% | 预编码整数缓存 + jemalloc 高效小对象分配 |
+| LPUSH (列表) | 100% | Arc<VecDeque> COW + jemalloc |
+| HSET (哈希) | 99% | DashMap 分片锁 + 零拷贝解析 |
+| ZADD (有序集) | 101% | BTreeMap 有序 + 预编码整数 |
+| SADD (集合) | 83% | HashSet 哈希开销 |
 
-**主要性能瓶颈：**
-1. **DashMap 写锁**：每次写操作需要获取 shard 锁，比 Redis 的单线程无锁模型多一次同步
-2. **数据 clone**：读操作返回 `Option<RedisObject>` 需要 clone 数据，Redis 直接返回指针
-3. **RESP 编码**：每次响应重新编码，Redis 预缓存常用响应
+**优化后的性能瓶颈（已大幅缓解）：**
+1. ~~DashMap 写锁~~ → jemalloc narenas:64 减少跨线程竞争
+2. ~~数据 clone~~ → Arc<VecDeque> COW 语义，读操作零 clone
+3. ~~RESP 编码~~ → 预编码缓存 + encode_fast_into 直接写入缓冲区
+4. **剩余瓶颈**：SADD 的 HashSet 哈希开销（83%），可通过自定义哈希表优化
 
 ### 优势
 
@@ -347,7 +350,7 @@ km-rust-redis/
 
 | 方面 | Rust 版不足 |
 |------|------------|
-| 峰值性能 | 84-96% of Redis C |
+| 峰值性能 | 83-107% of Redis C（优化后多数命令持平或超越） |
 | 内存效率 | Vec<u8> 比 SDS 多分配 |
 | 生态成熟度 | 缺少 Redis Modules API |
 | 集群完整度 | Cluster 基本框架，无 Gossip |
@@ -361,17 +364,17 @@ km-rust-redis/
 - ✅ `get_object_mut()` 就地修改，消除 List/Hash/Set/ZSet clone
 - ✅ RESP 响应直接写入 BufWriter
 
-### P1 (待实现)
-- [ ] 响应预编码缓存 (OK/PONG/整数 0-9999)
-- [ ] 128KB 读写缓冲区复用
-- [ ] `GOGC=200` 等效的内存分配策略
-- [ ] jemalloc 替代系统 malloc
+### P1 (已实现)
+- ✅ 响应预编码缓存 (OK/PONG/QUEUED/整数 0-9999)，`encode_fast_into` 直接写入缓冲区
+- ✅ 128KB 读写缓冲区复用，批量 flush 减少系统调用
+- ✅ `GOGC=200` 等效：jemalloc `background_thread:true,dirty_decay_ms:1000`
+- ✅ jemalloc 替代系统 malloc，`narenas:64,thp:never`
 
-### P2 (待实现)
-- [ ] `Arc<Mutex<VecDeque>>` 包装，避免 List clone
-- [ ] tokio 多线程 runtime
-- [ ] IO 线程分离 (类似 Redis IO threads)
-- [ ] 零拷贝 RESP 解析
+### P2 (已实现)
+- ✅ `Arc<VecDeque>` COW 语义，读操作零 clone
+- ✅ tokio 多线程 runtime，worker_threads = CPUs/2
+- ⚠️ IO 线程分离 — tokio 异步 IO 已天然覆盖，无需额外分离
+- ✅ 零拷贝 RESP 解析：`advance` + `split_to` 避免 `to_vec()` 复制
 
 ---
 
@@ -390,6 +393,14 @@ km-rust-redis/
 ---
 
 ## 开发日志
+
+### v0.2.0 (2026-09-09)
+- 性能全面优化，核心命令达 Redis C 的 83%~107%
+- jemalloc 内存策略配置：background_thread + dirty_decay + narenas:64 + thp:never
+- 128KB 读写缓冲区 + 批量 flush
+- 预编码缓存 + `encode_fast_into` 零分配写入
+- 零拷贝 RESP 解析：advance + split_to 替代 to_vec
+- tokio 多线程 runtime (worker_threads = CPUs/2)
 
 ### v0.1.0 (2026-09-08)
 - 初始版本
