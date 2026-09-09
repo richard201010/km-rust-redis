@@ -7,6 +7,22 @@
 //! - 命令表分发机制将命令路由到 commands.rs 中的各 handler 函数
 //! - 支持数据类型：String、List、Hash、Set、ZSet
 
+// jemalloc 替代系统 malloc，对频繁小对象分配（Vec<u8>、HashMap 节点等）性能更优
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// jemalloc 内存策略配置 — 等效 Go 的 GOGC=200
+// background_thread:true → 后台线程异步清理脏页，避免主线程停顿
+// dirty_decay_ms:1000    → 脏页1秒衰减，平衡内存占用与分配性能（等效高GOGC）
+// muzzy_decay_ms:1000    → muzzy页1秒衰减，减少 RSS 峰值
+// narenas:2*ncpus        → arena数=2倍CPU核数，减少跨线程竞争（等效GOMAXPROCS*2）
+// thp:never              → 禁用透明大页，Redis经验：THP导致延迟毛刺
+#[cfg(not(target_env = "msvc"))]
+#[export_name = "malloc_conf"]
+pub static MALLOC_CONF: &[u8] =
+    b"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:1000,narenas:64,thp:never\0";
+
 // 模块声明：分别负责命令实现、数据库存储、RESP 协议解析、数据类型定义
 mod acl;
 mod aof;
@@ -157,8 +173,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
 
     // 将 TCP 流拆分为读/写两个独立句柄，避免借用冲突
     let (reader, mut writer) = stream.into_split();
-    // 用 BufReader 包装读取端，减少系统调用次数
-    let mut reader = BufReader::new(reader);
+    // 用 BufReader 包装读取端，128KB 读缓冲区减少系统调用次数
+    let mut reader = BufReader::with_capacity(128 * 1024, reader);
     // 创建 RESP 协议解析器（有状态，支持跨 read 缓冲区的分包/粘包处理）
     let mut parser = RespParser::new();
 
@@ -175,8 +191,10 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
     // Pub/Sub 订阅的频道列表（预留）
     let mut sub_channels: Vec<String> = Vec::new();
 
-    // 读取缓冲区，每次从 socket 最多读 8KB
-    let mut read_buf = vec![0u8; 8192];
+    // 读取缓冲区 128KB，匹配 BufReader 容量
+    let mut read_buf = vec![0u8; 128 * 1024];
+    // 写缓冲区 128KB，累积多个响应后批量 flush
+    let mut write_buf = bytes::BytesMut::with_capacity(128 * 1024);
 
     loop {
         // 从 TCP socket 异步读取数据到缓冲区
@@ -233,8 +251,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             // 未认证状态下只允许 AUTH 和 QUIT 命令，其余一律拒绝
             if !authenticated && cmd_name != "auth" && cmd_name != "quit" {
                 let reply = RespValue::err("NOAUTH Authentication required");
-                let bytes = reply.encode(false);
-                let _ = writer.write_all(&bytes).await;
+                let bytes = reply.encode_fast();
+                write_buf.extend_from_slice(&bytes);
                 continue;
             }
 
@@ -247,12 +265,12 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                         if (new_db as usize) < db.databases.len() {
                             db_id = new_db;
                             let reply = RespValue::ok();
-                            let bytes = reply.encode(false);
-                            let _ = writer.write_all(&bytes).await;
+                            let bytes = reply.encode_fast();
+                            write_buf.extend_from_slice(&bytes);
                         } else {
                             let reply = RespValue::err(format!("ERR invalid DB index {}", new_db));
-                            let bytes = reply.encode(false);
-                            let _ = writer.write_all(&bytes).await;
+                            let bytes = reply.encode_fast();
+                            write_buf.extend_from_slice(&bytes);
                         }
                     }
                 }
@@ -263,8 +281,9 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             // 回复 OK 后直接返回，tokio 任务结束即释放连接资源
             if cmd_name == "quit" {
                 let reply = RespValue::ok();
-                let bytes = reply.encode(false);
-                let _ = writer.write_all(&bytes).await;
+                let bytes = reply.encode_fast();
+                write_buf.extend_from_slice(&bytes);
+                let _ = writer.write_all(&write_buf).await;
                 log::info!("Client {} quit", client_id);
                 return;
             }
@@ -275,8 +294,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             if cmd_name == "auth" {
                 if state.password.is_empty() {
                     let reply = RespValue::err("ERR Client sent AUTH, but no password is set");
-                    let bytes = reply.encode(false);
-                    let _ = writer.write_all(&bytes).await;
+                    let bytes = reply.encode_fast();
+                    write_buf.extend_from_slice(&bytes);
                 } else {
                     let pwd = argv
                         .get(1)
@@ -285,12 +304,12 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                     if pwd == state.password {
                         authenticated = true;
                         let reply = RespValue::ok();
-                        let bytes = reply.encode(false);
-                        let _ = writer.write_all(&bytes).await;
+                        let bytes = reply.encode_fast();
+                        write_buf.extend_from_slice(&bytes);
                     } else {
                         let reply = RespValue::err("ERR invalid password");
-                        let bytes = reply.encode(false);
-                        let _ = writer.write_all(&bytes).await;
+                        let bytes = reply.encode_fast();
+                        write_buf.extend_from_slice(&bytes);
                     }
                 }
                 continue;
@@ -302,8 +321,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                 in_transaction = true;
                 transaction_queue.clear();
                 let reply = RespValue::ok();
-                let bytes = reply.encode(false);
-                let _ = writer.write_all(&bytes).await;
+                let bytes = reply.encode_fast();
+                write_buf.extend_from_slice(&bytes);
                 continue;
             }
 
@@ -313,8 +332,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             if cmd_name == "exec" {
                 if !in_transaction {
                     let reply = RespValue::err("ERR EXEC without MULTI");
-                    let bytes = reply.encode(false);
-                    let _ = writer.write_all(&bytes).await;
+                    let bytes = reply.encode_fast();
+                    write_buf.extend_from_slice(&bytes);
                     continue;
                 }
                 in_transaction = false;
@@ -325,8 +344,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                     results.push(result);
                 }
                 let reply = RespValue::Array(results);
-                let bytes = reply.encode(false);
-                let _ = writer.write_all(&bytes).await;
+                let bytes = reply.encode_fast();
+                write_buf.extend_from_slice(&bytes);
                 continue;
             }
 
@@ -335,15 +354,15 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             if cmd_name == "discard" {
                 if !in_transaction {
                     let reply = RespValue::err("ERR DISCARD without MULTI");
-                    let bytes = reply.encode(false);
-                    let _ = writer.write_all(&bytes).await;
+                    let bytes = reply.encode_fast();
+                    write_buf.extend_from_slice(&bytes);
                     continue;
                 }
                 in_transaction = false;
                 transaction_queue.clear();
                 let reply = RespValue::ok();
-                let bytes = reply.encode(false);
-                let _ = writer.write_all(&bytes).await;
+                let bytes = reply.encode_fast();
+                write_buf.extend_from_slice(&bytes);
                 continue;
             }
 
@@ -353,8 +372,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             if in_transaction {
                 transaction_queue.push(argv.clone());
                 let reply = RespValue::SimpleString("QUEUED".to_string());
-                let bytes = reply.encode(false);
-                let _ = writer.write_all(&bytes).await;
+                let bytes = reply.encode_fast();
+                write_buf.extend_from_slice(&bytes);
                 continue;
             }
 
@@ -373,8 +392,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                         RespValue::BulkString(b"".to_vec()),
                     ])
                 };
-                let bytes = reply.encode(false);
-                let _ = writer.write_all(&bytes).await;
+                let bytes = reply.encode_fast();
+                write_buf.extend_from_slice(&bytes);
                 continue;
             }
 
@@ -386,8 +405,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                     Ok(()) => RespValue::ok(),
                     Err(e) => RespValue::err(format!("ERR SAVE failed: {}", e)),
                 };
-                let bytes = reply.encode(false);
-                let _ = writer.write_all(&bytes).await;
+                let bytes = reply.encode_fast();
+                write_buf.extend_from_slice(&bytes);
                 continue;
             }
             if cmd_name == "bgsave" {
@@ -401,8 +420,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                     }
                 });
                 let reply = RespValue::SimpleString("Background saving started".to_string());
-                let bytes = reply.encode(false);
-                let _ = writer.write_all(&bytes).await;
+                let bytes = reply.encode_fast();
+                write_buf.extend_from_slice(&bytes);
                 continue;
             }
 
@@ -425,11 +444,16 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                 }
             }
 
-            let bytes = result.encode(false);
-            if let Err(e) = writer.write_all(&bytes).await {
+            let bytes = result.encode_fast();
+            write_buf.extend_from_slice(&bytes);
+        }
+        // 批量flush写缓冲区：累积的多条响应一次性写入
+        if !write_buf.is_empty() {
+            if let Err(e) = writer.write_all(&write_buf).await {
                 log::error!("Client {} write error: {}", client_id, e);
                 return;
             }
+            write_buf.clear();
         }
     }
 }
@@ -532,8 +556,23 @@ async fn active_expire_loop(state: Arc<ServerState>) {
 // 6. 启动后台主动过期 tokio 任务
 // 7. 进入 accept 循环，为每个新连接 spawn 独立的 tokio 任务处理
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error>> {
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // 动态检测 CPU 核心数，worker_threads 设为核心数的一半（避免过度竞争）
+    let num_cpus = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4);
+    let worker_threads = (num_cpus / 2).max(2);
+    log::info!("Tokio multi_thread runtime: {} worker threads ({} CPUs detected)", worker_threads, num_cpus);
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(worker_threads)
+        .enable_all()
+        .build()?;
+
+    runtime.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     // 解析命令行参数（clap 自动生成 --help 和参数校验）
     let args = Args::parse();
 

@@ -158,6 +158,30 @@ impl RespValue {
         buf
     }
 
+    /// 快速编码 — 使用预缓存的常用响应，避免重复序列化。
+    /// OK/PONG/QUEUED/Null/整数0-9999 直接返回预编码字节，其余回退到 encode(false)。
+    pub fn encode_fast(&self) -> Vec<u8> {
+        use std::sync::OnceLock;
+        // 整数 0-9999 预编码缓存
+        fn int_cache() -> &'static Vec<Vec<u8>> {
+            static CACHE: OnceLock<Vec<Vec<u8>>> = OnceLock::new();
+            CACHE.get_or_init(|| {
+                (0..10000).map(|i| format!(":{}\r\n", i).into_bytes()).collect()
+            })
+        }
+        match self {
+            RespValue::SimpleString(s) if s == "OK" => b"+OK\r\n".to_vec(),
+            RespValue::SimpleString(s) if s == "PONG" => b"+PONG\r\n".to_vec(),
+            RespValue::SimpleString(s) if s == "QUEUED" => b"+QUEUED\r\n".to_vec(),
+            RespValue::Null => b"$-1\r\n".to_vec(),
+            RespValue::NullArray => b"*-1\r\n".to_vec(),
+            RespValue::Integer(n) if *n >= 0 && *n < 10000 => int_cache()[*n as usize].clone(),
+            RespValue::Integer(0) => b":0\r\n".to_vec(),
+            RespValue::Integer(1) => b":1\r\n".to_vec(),
+            _ => self.encode(false),
+        }
+    }
+
     /// 将 RespValue 编码并追加到指定缓冲区（避免重复分配）
     ///
     /// 编码逻辑按类型分派：
