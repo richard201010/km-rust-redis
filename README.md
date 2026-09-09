@@ -72,16 +72,22 @@ LRANGE_100   131K rps     230K rps    176%    🚀 大幅超越
 |------|------|------|
 | 294 条 Redis 命令 | ✅ 100% | 覆盖 Redis 8 全部 289 个顶层命令 |
 | 6 种数据类型 | ✅ | String/List/Hash/Set/ZSet/Stream |
-| RESP2/RESP3 协议 | ✅ | 完整双版本支持 |
+| RESP2/RESP3 协议 | ✅ | 完整双版本 + memchr SIMD 解析 |
 | AOF 持久化 | ✅ | 写命令实时追加 + 启动回放 |
 | RDB 快照 | ✅ | SAVE/BGSAVE + 定时自动快照 |
 | Lua 5.4 脚本 | ✅ | mlua 引擎, redis.call/pcall 30+ 命令 |
-| Pub/Sub 发布订阅 | ✅ | SUBSCRIBE/PUBLISH + 模式匹配 |
+| Pub/Sub 发布订阅 | ✅ | SUBSCRIBE/PUBLISH + PSUBSCRIBE + SSUBSCRIBE |
 | ACL 访问控制 | ✅ | 用户管理 + 权限控制 + 文件持久化 |
 | GEO 地理位置 | ✅ | GEOADD/GEODIST/GEOSEARCH |
 | HyperLogLog | ✅ | PFADD/PFCOUNT/PFMERGE |
 | Bitmap 位图 | ✅ | GETBIT/SETBIT/BITCOUNT/BITFIELD |
 | 事务 | ✅ | MULTI/EXEC/DISCARD/WATCH |
+| INFO 状态统计 | ✅ | 完整 Server/Clients/Memory/Stats/Keyspace/Replication/CPU |
+| COMMAND 命令监控 | ✅ | COUNT/INFO/完整命令元数据 (name/arity/flags) |
+| MONITOR 实时监控 | ✅ | 命令实时日志推送 |
+| SLOWLOG 慢查询 | ✅ | LEN/GET/RESET 标准子命令 |
+| CONFIG 配置管理 | ✅ | GET (15+配置项) + SET + REWRITE |
+| PUBSUB 频道信息 | ✅ | CHANNELS/NUMSUB/NUMPAT |
 
 ### 高可用
 
@@ -198,6 +204,17 @@ OK
 "world"
 > EVAL "return redis.call('SET', KEYS[1], ARGV[1])" 1 mykey myvalue
 OK
+> INFO server
+# Server
+redis_version:0.4.1
+redis_mode:standalone
+os:macos
+uptime_in_seconds:42
+> CONFIG GET maxmemory
+1) "maxmemory"
+2) "0"
+> COMMAND COUNT
+(integer) 294
 > CLUSTER INFO
 cluster_state:ok
 cluster_slots:16384
@@ -224,7 +241,7 @@ km-rust-redis/
 ├── Cargo.toml              # 依赖配置
 ├── src/
 │   ├── main.rs             # 入口 + 事件循环 + RwLock + TLS
-│   ├── commands.rs         # 5044 行, 294 条命令实现
+│   ├── commands.rs         # 5343 行, 294 条命令 + INFO/COMMAND/CONFIG/PubSub
 │   ├── resp.rs             # RESP2/3 + memchr SIMD 解析
 │   ├── db.rs               # DashMap 多数据库 + 过期管理
 │   ├── types.rs            # RedisObject + ZSet + OrderedFloat
@@ -237,7 +254,7 @@ km-rust-redis/
 │   ├── stream.rs           # Stream + 消费者组
 │   ├── rdb.rs              # RDB 快照
 │   ├── aof.rs              # AOF 追加
-│   ├── pubsub.rs           # 发布订阅
+│   ├── pubsub.rs           # 发布订阅 (频道管理器)
 │   └── scan.rs             # SCAN 游标
 ├── target/release/
 │   └── km-rust-redis      # 2.5MB 单二进制
@@ -287,6 +304,17 @@ km-rust-redis/
 ---
 
 ## 开发日志
+
+### v0.4.1 (2026-09-09) — Redis 标准化版
+- INFO: 返回真实统计 (uptime/connections/commands/keyspace/replication/cpu/cluster)
+- COMMAND: 返回完整命令信息 (name/arity/flags) + COUNT/INFO 子命令
+- SUBSCRIBE/UNSUBSCRIBE: 接入 pubsub_channels 管理
+- PUBLISH: 标准 RESP 消息格式
+- PSUBSCRIBE/PUNSUBSCRIBE/SSUBSCRIBE/SUNSUBSCRIBE: 完整 Pub/Sub
+- MONITOR: 支持实时命令监控
+- SLOWLOG: LEN/GET/RESET 标准子命令
+- CONFIG GET: 支持 15+ 常用配置项 + * 全量返回
+- PUBSUB: CHANNELS/NUMSUB/NUMPAT 子命令
 
 ### v0.4.0 (2026-09-09) — 功能完整版
 - Lua 5.4 完整语法: mlua 引擎, redis.call/pcall 30+ 命令
