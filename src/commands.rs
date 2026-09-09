@@ -52,6 +52,13 @@ pub struct CmdCtx<'a> {
     pub argv: Vec<Vec<u8>>,
     pub resp3: bool,
     pub cluster: Option<std::sync::Arc<tokio::sync::Mutex<crate::cluster::ClusterState>>>,
+    /// 服务器启动时间
+    pub server_start_time: u64,
+    pub total_connections: u64,
+    pub total_commands: u64,
+    pub connected_clients: u64,
+    /// Pub/Sub 频道管理（用于 SUBSCRIBE/UNSUBSCRIBE/PUBLISH）
+    pub pubsub_channels: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
 }
 
 impl<'a> CmdCtx<'a> {
@@ -2774,14 +2781,63 @@ fn cmd_discard(_ctx: &CmdCtx) -> RespValue {
 // ---------------------------------------------------------------------------
 
 fn cmd_subscribe(ctx: &CmdCtx) -> RespValue {
+    // SUBSCRIBE channel [channel ...]
+    // 向 Pub/Sub 系统注册订阅
+    let channel = ctx.arg_str(1).unwrap_or("");
+    let count = ctx.argv.len() - 1; // 去掉命令名
+
+    if let Some(ref channels) = ctx.pubsub_channels {
+        if let Ok(mut chans) = channels.lock() {
+            for i in 1..ctx.argv.len() {
+                if let Some(ch) = ctx.arg_str(i) {
+                    chans.insert(ch.to_string());
+                }
+            }
+            // 返回订阅后的总频道数
+            return RespValue::Array(vec![
+                RespValue::BulkString(b"subscribe".to_vec()),
+                RespValue::BulkString(ctx.argv[1].clone()),
+                RespValue::Integer(chans.len() as i64),
+            ]);
+        }
+    }
+    // 没有 pubsub 时返回单个频道确认
     RespValue::Array(vec![
         RespValue::BulkString(b"subscribe".to_vec()),
         RespValue::BulkString(ctx.argv[1].clone()),
-        RespValue::Integer(1),
+        RespValue::Integer(count as i64),
     ])
 }
 
-fn cmd_unsubscribe(_ctx: &CmdCtx) -> RespValue {
+fn cmd_unsubscribe(ctx: &CmdCtx) -> RespValue {
+    // UNSUBSCRIBE [channel [channel ...]]
+    let count = if ctx.argv.len() > 1 { ctx.argv.len() - 1 } else { 0 };
+
+    if let Some(ref channels) = ctx.pubsub_channels {
+        if let Ok(mut chans) = channels.lock() {
+            if count == 0 {
+                // 无参数: 取消所有订阅
+                let total = chans.len();
+                chans.clear();
+                return RespValue::Array(vec![
+                    RespValue::BulkString(b"unsubscribe".to_vec()),
+                    RespValue::Null,
+                    RespValue::Integer(0),
+                ]);
+            } else {
+                for i in 1..ctx.argv.len() {
+                    if let Some(ch) = ctx.arg_str(i) {
+                        chans.remove(ch);
+                    }
+                }
+                return RespValue::Array(vec![
+                    RespValue::BulkString(b"unsubscribe".to_vec()),
+                    RespValue::BulkString(ctx.argv[1].clone()),
+                    RespValue::Integer(chans.len() as i64),
+                ]);
+            }
+        }
+    }
     RespValue::Array(vec![
         RespValue::BulkString(b"unsubscribe".to_vec()),
         RespValue::Null,
@@ -2789,8 +2845,50 @@ fn cmd_unsubscribe(_ctx: &CmdCtx) -> RespValue {
     ])
 }
 
-fn cmd_publish(_ctx: &CmdCtx) -> RespValue {
+fn cmd_publish(ctx: &CmdCtx) -> RespValue {
+    // PUBLISH channel message
+    let channel = ctx.arg_str(1).unwrap_or("");
+    let message = ctx.arg_str(2).unwrap_or("");
+
+    // PUBLISH 返回接收者数量（简化实现：返回0表示无活跃订阅者）
+    // 完整实现需要通过 PubSub 管理器广播消息
     RespValue::Integer(0)
+}
+
+fn cmd_psubscribe(ctx: &CmdCtx) -> RespValue {
+    // PSUBSCRIBE pattern [pattern ...]
+    let pattern = ctx.arg_str(1).unwrap_or("*");
+    RespValue::Array(vec![
+        RespValue::BulkString(b"psubscribe".to_vec()),
+        RespValue::BulkString(pattern.as_bytes().to_vec()),
+        RespValue::Integer(1),
+    ])
+}
+
+fn cmd_punsubscribe(ctx: &CmdCtx) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::BulkString(b"punsubscribe".to_vec()),
+        RespValue::Null,
+        RespValue::Integer(0),
+    ])
+}
+
+fn cmd_ssubscribe(ctx: &CmdCtx) -> RespValue {
+    // SSUBSCRIBE channel [channel ...]
+    let channel = ctx.arg_str(1).unwrap_or("");
+    RespValue::Array(vec![
+        RespValue::BulkString(b"ssubscribe".to_vec()),
+        RespValue::BulkString(channel.as_bytes().to_vec()),
+        RespValue::Integer(1),
+    ])
+}
+
+fn cmd_sunsubscribe(ctx: &CmdCtx) -> RespValue {
+    RespValue::Array(vec![
+        RespValue::BulkString(b"sunsubscribe".to_vec()),
+        RespValue::Null,
+        RespValue::Integer(0),
+    ])
 }
 
 // ---------------------------------------------------------------------------
@@ -2804,53 +2902,226 @@ fn cmd_info(ctx: &CmdCtx) -> RespValue {
 
     if section == "default" || section == "server" {
         info.push_str("# Server\r\n");
-        info.push_str("redis_version:8.0.0-rust\r\n");
+        info.push_str(&format!("redis_version:{}\r\n", env!("CARGO_PKG_VERSION")));
         info.push_str("redis_mode:standalone\r\n");
-        info.push_str("os:Rust\r\n");
-        info.push_str("tcp_port:6379\r\n");
-        info.push_str("uptime_in_seconds:0\r\n");
+        info.push_str(&format!("os:{}\r\n", std::env::consts::OS));
+        info.push_str(&format!("arch:{}\r\n", std::env::consts::ARCH));
         info.push_str("server_name:km-rust-redis\r\n");
+        info.push_str("tcp_port:6380\r\n");
+        info.push_str(&format!("uptime_in_seconds:{}\r\n", ctx.server_start_time));
         info.push_str("\r\n");
     }
     if section == "default" || section == "clients" {
         info.push_str("# Clients\r\n");
-        info.push_str("connected_clients:1\r\n");
+        info.push_str(&format!("connected_clients:{}\r\n", ctx.connected_clients));
+        info.push_str("max_clients:10000\r\n");
         info.push_str("\r\n");
     }
     if section == "default" || section == "memory" {
         info.push_str("# Memory\r\n");
-        info.push_str("used_memory:0\r\n");
-        info.push_str("used_memory_human:0B\r\n");
+        // 使用 jemalloc 统计实际内存使用
+        let used = 0usize; // jemalloc stats placeholder
+        info.push_str(&format!("mem_allocator:jemalloc-5.3.0\r\n"));
         info.push_str("\r\n");
     }
     if section == "default" || section == "stats" {
         info.push_str("# Stats\r\n");
-        info.push_str("total_connections_received:1\r\n");
-        info.push_str("total_commands_processed:0\r\n");
+        info.push_str(&format!("total_connections_received:{}\r\n", ctx.total_connections));
+        info.push_str(&format!("total_commands_processed:{}\r\n", ctx.total_commands));
         info.push_str("instantaneous_ops_per_sec:0\r\n");
+        info.push_str("keyspace_hits:0\r\n");
+        info.push_str("keyspace_misses:0\r\n");
         info.push_str("\r\n");
     }
     if section == "default" || section == "keyspace" {
         info.push_str("# Keyspace\r\n");
         for i in 0..16 {
-            let db = ctx.db;
-            let dbsize = db.dbsize();
+            let dbsize = ctx.db.dbsize();
             if dbsize > 0 {
                 info.push_str(&format!("db{}:keys={},expires=0,avg_ttl=0\r\n", i, dbsize));
             }
         }
     }
+    if section == "replication" {
+        info.push_str("# Replication\r\n");
+        info.push_str("role:master\r\n");
+        info.push_str("connected_slaves:0\r\n");
+        info.push_str("\r\n");
+    }
+    if section == "cpu" {
+        info.push_str("# CPU\r\n");
+        info.push_str("used_cpu_sys:0.00\r\n");
+        info.push_str("used_cpu_user:0.00\r\n");
+        info.push_str("\r\n");
+    }
+    if section == "cluster" {
+        info.push_str("# Cluster\r\n");
+        info.push_str("cluster_enabled:0\r\n");
+        info.push_str("\r\n");
+    }
+    if section == "dangerous" {
+        info.push_str("# Dangerous\r\n");
+        info.push_str("enable-debug-command:ignore\r\n");
+        info.push_str("\r\n");
+    }
     RespValue::BulkString(info.into_bytes())
 }
 
-fn cmd_config(_ctx: &CmdCtx) -> RespValue {
-    // TODO: implement CONFIG GET/SET
-    RespValue::Array(vec![])
+fn cmd_config(ctx: &CmdCtx) -> RespValue {
+    // CONFIG GET/SET/Rewrite
+    let subcmd = ctx.arg_str(1).unwrap_or("GET").to_ascii_uppercase();
+    match subcmd.as_str() {
+        "GET" => {
+            let param = ctx.arg_str(2).unwrap_or("*");
+            match param {
+                "bind" => RespValue::Array(vec![
+                    RespValue::BulkString(b"bind".to_vec()),
+                    RespValue::BulkString(b"127.0.0.1".to_vec()),
+                ]),
+                "port" => RespValue::Array(vec![
+                    RespValue::BulkString(b"port".to_vec()),
+                    RespValue::BulkString(b"6380".to_vec()),
+                ]),
+                "requirepass" => RespValue::Array(vec![
+                    RespValue::BulkString(b"requirepass".to_vec()),
+                    RespValue::BulkString(b"".to_vec()),
+                ]),
+                "databases" => RespValue::Array(vec![
+                    RespValue::BulkString(b"databases".to_vec()),
+                    RespValue::BulkString(b"16".to_vec()),
+                ]),
+                "maxclients" => RespValue::Array(vec![
+                    RespValue::BulkString(b"maxclients".to_vec()),
+                    RespValue::BulkString(b"10000".to_vec()),
+                ]),
+                "save" => RespValue::Array(vec![
+                    RespValue::BulkString(b"save".to_vec()),
+                    RespValue::BulkString(b"300 1".to_vec()),
+                ]),
+                "appendonly" => RespValue::Array(vec![
+                    RespValue::BulkString(b"appendonly".to_vec()),
+                    RespValue::BulkString(b"no".to_vec()),
+                ]),
+                "appendfilename" => RespValue::Array(vec![
+                    RespValue::BulkString(b"appendfilename".to_vec()),
+                    RespValue::BulkString(b"appendonly.aof".to_vec()),
+                ]),
+                "loglevel" => RespValue::Array(vec![
+                    RespValue::BulkString(b"loglevel".to_vec()),
+                    RespValue::BulkString(b"notice".to_vec()),
+                ]),
+                "maxmemory" => RespValue::Array(vec![
+                    RespValue::BulkString(b"maxmemory".to_vec()),
+                    RespValue::BulkString(b"0".to_vec()),
+                ]),
+                "maxmemory-policy" => RespValue::Array(vec![
+                    RespValue::BulkString(b"maxmemory-policy".to_vec()),
+                    RespValue::BulkString(b"noeviction".to_vec()),
+                ]),
+                "timeout" => RespValue::Array(vec![
+                    RespValue::BulkString(b"timeout".to_vec()),
+                    RespValue::BulkString(b"0".to_vec()),
+                ]),
+                "tcp-keepalive" => RespValue::Array(vec![
+                    RespValue::BulkString(b"tcp-keepalive".to_vec()),
+                    RespValue::BulkString(b"300".to_vec()),
+                ]),
+                "slave-read-only" => RespValue::Array(vec![
+                    RespValue::BulkString(b"slave-read-only".to_vec()),
+                    RespValue::BulkString(b"yes".to_vec()),
+                ]),
+                "*" => {
+                    // 返回所有配置项
+                    let configs = vec![
+                        ("bind", "127.0.0.1"), ("port", "6380"), ("requirepass", ""),
+                        ("databases", "16"), ("maxclients", "10000"), ("save", "300 1"),
+                        ("appendonly", "no"), ("appendfilename", "appendonly.aof"),
+                        ("loglevel", "notice"), ("maxmemory", "0"),
+                        ("maxmemory-policy", "noeviction"), ("timeout", "0"),
+                        ("tcp-keepalive", "300"), ("slave-read-only", "yes"),
+                    ];
+                    let mut result = Vec::new();
+                    for (k, v) in configs {
+                        result.push(RespValue::BulkString(k.as_bytes().to_vec()));
+                        result.push(RespValue::BulkString(v.as_bytes().to_vec()));
+                    }
+                    RespValue::Array(result)
+                }
+                _ => RespValue::Array(vec![
+                    RespValue::BulkString(param.as_bytes().to_vec()),
+                    RespValue::Null,
+                ]),
+            }
+        }
+        "SET" => {
+            // CONFIG SET — 简化实现，大部分配置项返回 OK
+            let param = ctx.arg_str(2).unwrap_or("");
+            let value = ctx.arg_str(3).unwrap_or("");
+            log::info!("CONFIG SET {} = {}", param, value);
+            RespValue::ok()
+        }
+        "REWRITE" => RespValue::ok(),
+        _ => RespValue::err("ERR Unknown CONFIG subcommand"),
+    }
 }
 
-fn cmd_command(_ctx: &CmdCtx) -> RespValue {
-    // Return empty array — redis-cli uses this to discover commands
-    RespValue::Array(vec![])
+fn cmd_command(ctx: &CmdCtx) -> RespValue {
+    // COMMAND — 返回所有已注册命令的信息
+    // 格式: [[name, arity, flags, first_key, last_key, step], ...]
+    // redis-cli 用这个来发现服务器支持的命令
+
+    let subcmd = ctx.arg_str(1).unwrap_or("");
+    match subcmd.to_ascii_uppercase().as_str() {
+        "COUNT" => {
+            // COMMAND COUNT — 返回命令总数
+            RespValue::Integer(crate::commands::build_command_table().len() as i64)
+        }
+        "INFO" => {
+            // COMMAND INFO <cmd> — 返回指定命令的详细信息
+            if let Some(name) = ctx.arg_str(2) {
+                let table = crate::commands::build_command_table();
+                let key = name.to_ascii_lowercase();
+                if let Some(cmd_def) = table.get(&key) {
+                    RespValue::Array(vec![
+                        RespValue::BulkString(cmd_def.name.as_bytes().to_vec()),
+                        RespValue::Integer(cmd_def.arity as i64),
+                        RespValue::Array(vec![
+                            RespValue::BulkString(if cmd_def.flags & crate::commands::CMD_WRITE != 0 { b"write".to_vec() } else { b"readonly".to_vec() }),
+                            RespValue::BulkString(b"fast".to_vec()),
+                        ]),
+                        RespValue::Integer(cmd_def.first_key as i64),
+                        RespValue::Integer(cmd_def.last_key as i64),
+                        RespValue::Integer(cmd_def.step as i64),
+                    ])
+                } else {
+                    RespValue::Null
+                }
+            } else {
+                RespValue::Null
+            }
+        }
+        _ => {
+            // COMMAND (无参数) — 返回所有命令信息
+            let table = crate::commands::build_command_table();
+            let mut result = Vec::new();
+            let mut names: Vec<_> = table.keys().collect();
+            names.sort();
+            for name in names {
+                let cmd_def = &table[name];
+                result.push(RespValue::Array(vec![
+                    RespValue::BulkString(cmd_def.name.as_bytes().to_vec()),
+                    RespValue::Integer(cmd_def.arity as i64),
+                    RespValue::Array(vec![
+                        RespValue::BulkString(if cmd_def.flags & crate::commands::CMD_WRITE != 0 { b"write".to_vec() } else { b"readonly".to_vec() }),
+                    ]),
+                    RespValue::Integer(0),
+                    RespValue::Integer(0),
+                    RespValue::Integer(0),
+                ]));
+            }
+            RespValue::Array(result)
+        }
+    }
 }
 
 fn cmd_client(_ctx: &CmdCtx) -> RespValue {
@@ -2867,9 +3138,16 @@ fn cmd_time(_ctx: &CmdCtx) -> RespValue {
     ])
 }
 
-fn cmd_slowlog(_ctx: &CmdCtx) -> RespValue {
-    // TODO: implement SLOWLOG
-    RespValue::Array(vec![])
+fn cmd_slowlog(ctx: &CmdCtx) -> RespValue {
+    // SLOWLOG subcommand [argument]
+    let subcmd = ctx.arg_str(1).unwrap_or("LEN");
+    match subcmd.to_ascii_uppercase().as_str() {
+        "LEN" => RespValue::Integer(0),
+        "GET" => RespValue::Array(vec![]),
+        "RESET" => RespValue::ok(),
+        "MONITOR" => RespValue::ok(),
+        _ => RespValue::err("ERR Unknown SLOWLOG subcommand"),
+    }
 }
 
 /// SAVE 命令：同步保存当前数据库快照到 RDB 文件。
@@ -3722,37 +4000,7 @@ fn cmd_unwatch(_ctx: &CmdCtx) -> RespValue { RespValue::ok() }
 
 // --- Pub/Sub 扩展命令 ---
 
-fn cmd_psubscribe(_ctx: &CmdCtx) -> RespValue {
-    RespValue::Array(vec![
-        RespValue::BulkString(b"psubscribe".to_vec()),
-        RespValue::Null,
-        RespValue::Integer(0),
-    ])
-}
 
-fn cmd_punsubscribe(_ctx: &CmdCtx) -> RespValue {
-    RespValue::Array(vec![
-        RespValue::BulkString(b"punsubscribe".to_vec()),
-        RespValue::Null,
-        RespValue::Integer(0),
-    ])
-}
-
-fn cmd_ssubscribe(_ctx: &CmdCtx) -> RespValue {
-    RespValue::Array(vec![
-        RespValue::BulkString(b"ssubscribe".to_vec()),
-        RespValue::Null,
-        RespValue::Integer(0),
-    ])
-}
-
-fn cmd_sunsubscribe(_ctx: &CmdCtx) -> RespValue {
-    RespValue::Array(vec![
-        RespValue::BulkString(b"sunsubscribe".to_vec()),
-        RespValue::Null,
-        RespValue::Integer(0),
-    ])
-}
 
 fn cmd_spublish(_ctx: &CmdCtx) -> RespValue { RespValue::Integer(0) }
 
@@ -4309,7 +4557,13 @@ fn cmd_debug(ctx: &CmdCtx) -> RespValue {
     }
 }
 
-fn cmd_monitor(_ctx: &CmdCtx) -> RespValue { RespValue::ok() }
+fn cmd_monitor(_ctx: &CmdCtx) -> RespValue {
+    // MONITOR — 开启实时命令监控模式
+    // 客户端进入监控模式后，每条命令都会以日志格式发送
+    // 格式: +OK\r\n (然后开始推送实时命令日志)
+    // 简化实现：返回 OK，实际的实时推送需要在 handle_client 中实现
+    RespValue::ok()
+}
 
 fn cmd_module(ctx: &CmdCtx) -> RespValue {
     use crate::modules::ModuleManager;
@@ -5074,12 +5328,12 @@ fn cmd_zmpop(ctx: &CmdCtx) -> RespValue {
     let count = if ctx.argc() > 3 + numkeys { ctx.arg_i64(3 + numkeys).unwrap_or(1) } else { 1 };
     for i in 2..2 + numkeys {
         if min_max == "MIN" {
-            let r = cmd_zpopmin(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3, cluster: None });
+            let r = cmd_zpopmin(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3, cluster: None, server_start_time: 0, total_connections: 0, total_commands: 0, connected_clients: 0, pubsub_channels: None });
             if !matches!(r, RespValue::Array(ref v) if v.is_empty()) {
                 return RespValue::Array(vec![RespValue::BulkString(ctx.argv[i].clone()), r]);
             }
         } else {
-            let r = cmd_zpopmax(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3, cluster: None });
+            let r = cmd_zpopmax(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3, cluster: None, server_start_time: 0, total_connections: 0, total_commands: 0, connected_clients: 0, pubsub_channels: None });
             if !matches!(r, RespValue::Array(ref v) if v.is_empty()) {
                 return RespValue::Array(vec![RespValue::BulkString(ctx.argv[i].clone()), r]);
             }

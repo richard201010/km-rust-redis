@@ -547,13 +547,26 @@ async fn execute_command(
         // 写命令：获取写锁
         let mut db_guard = state.db.write().await;
         let db_ref = db_guard.get_db(db_id);
-        let ctx = CmdCtx { db: db_ref, db_id, argv, resp3, cluster };
+        let ctx = CmdCtx {
+            db: db_ref, db_id, argv, resp3, cluster,
+            server_start_time: state.start_time.elapsed().as_secs(),
+            total_connections: state.total_connections.load(std::sync::atomic::Ordering::Relaxed),
+            total_commands: state.total_commands.load(std::sync::atomic::Ordering::Relaxed),
+            connected_clients: 1,
+            pubsub_channels: None,
+        };
         (cmd.handler)(&ctx)
     } else {
-        // 读命令：获取读锁（多个读命令可并行执行）
         let db_guard = state.db.read().await;
         let db_ref = db_guard.get_db(db_id);
-        let ctx = CmdCtx { db: db_ref, db_id, argv, resp3, cluster };
+        let ctx = CmdCtx {
+            db: db_ref, db_id, argv, resp3, cluster,
+            server_start_time: state.start_time.elapsed().as_secs(),
+            total_connections: state.total_connections.load(std::sync::atomic::Ordering::Relaxed),
+            total_commands: state.total_commands.load(std::sync::atomic::Ordering::Relaxed),
+            connected_clients: 1,
+            pubsub_channels: None,
+        };
         (cmd.handler)(&ctx)
     }
 }
