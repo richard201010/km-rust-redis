@@ -127,9 +127,9 @@ mod tests {
     #[test]
     fn test_scan_all_keys() {
         let db = Database::new(0);
-        db.set(b"alpha".to_vec(), RedisObject::String(b"1".to_vec()), None);
-        db.set(b"beta".to_vec(), RedisObject::String(b"2".to_vec()), None);
-        db.set(b"gamma".to_vec(), RedisObject::String(b"3".to_vec()), None);
+        db.set(b"alpha", RedisObject::String(b"1".to_vec()), None);
+        db.set(b"beta", RedisObject::String(b"2".to_vec()), None);
+        db.set(b"gamma", RedisObject::String(b"3".to_vec()), None);
 
         let (next, keys) = scan_keys(&db, 0, None, 10);
         assert_eq!(next, 0);
@@ -141,7 +141,7 @@ mod tests {
         let db = Database::new(0);
         for i in 0..10 {
             let key = format!("key{:02}", i);
-            db.set(key.into_bytes(), RedisObject::String(b"v".to_vec()), None);
+            db.set(&key.into_bytes(), RedisObject::String(b"v".to_vec()), None);
         }
 
         // 第一次扫描，返回 3 个键
@@ -167,9 +167,9 @@ mod tests {
     #[test]
     fn test_scan_with_pattern() {
         let db = Database::new(0);
-        db.set(b"user:1".to_vec(), RedisObject::String(b"a".to_vec()), None);
-        db.set(b"user:2".to_vec(), RedisObject::String(b"b".to_vec()), None);
-        db.set(b"item:1".to_vec(), RedisObject::String(b"c".to_vec()), None);
+        db.set(b"user:1", RedisObject::String(b"a".to_vec()), None);
+        db.set(b"user:2", RedisObject::String(b"b".to_vec()), None);
+        db.set(b"item:1", RedisObject::String(b"c".to_vec()), None);
 
         let (next, keys) = scan_keys(&db, 0, Some(b"user:*"), 100);
         assert_eq!(next, 0);
@@ -182,8 +182,8 @@ mod tests {
     #[test]
     fn test_scan_cursor_zero_after_complete() {
         let db = Database::new(0);
-        db.set(b"a".to_vec(), RedisObject::String(b"1".to_vec()), None);
-        db.set(b"b".to_vec(), RedisObject::String(b"2".to_vec()), None);
+        db.set(b"a", RedisObject::String(b"1".to_vec()), None);
+        db.set(b"b", RedisObject::String(b"2".to_vec()), None);
 
         let (next, _) = scan_keys(&db, 0, None, 100);
         assert_eq!(next, 0); // 全部返回，游标归零

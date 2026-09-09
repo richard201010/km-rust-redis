@@ -83,18 +83,15 @@ impl Database {
     /// - `key`: 键（字节向量）
     /// - `value`: 值（`RedisObject`，支持 String/Integer/List/Hash/Set/ZSet 等类型）
     /// - `expire_ms`: 可选的过期时长（毫秒），`None` 表示不设过期时间
-    pub fn set(&self, key: Vec<u8>, value: RedisObject, expire_ms: Option<u64>) {
-        let exists = self.data.contains_key(&key);
-        self.data.insert(key.clone(), value);
+    pub fn set(&self, key: &[u8], value: RedisObject, expire_ms: Option<u64>) {
+        let exists = self.data.contains_key(key);
+        self.data.insert(key.to_vec(), value);
         if let Some(ms) = expire_ms {
-            // 计算绝对过期时间 = 当前时间 + 相对过期时长
-            self.expires.insert(key.clone(), current_time_ms() + ms);
+            self.expires.insert(key.to_vec(), current_time_ms() + ms);
         } else {
-            // 无过期时间时，移除可能存在的旧过期记录
-            self.expires.remove(&key);
+            self.expires.remove(key);
         }
         if !exists {
-            // 新键插入，增加键计数
             self.key_count.fetch_add(1, Ordering::Relaxed);
         }
     }
@@ -280,13 +277,12 @@ impl Database {
     /// # 返回
     /// - `true`: 重命名成功
     /// - `false`: 原键不存在
-    pub fn rename(&self, old: &[u8], new: Vec<u8>) -> bool {
+    pub fn rename(&self, old: &[u8], new: &[u8]) -> bool {
         if let Some((_, val)) = self.data.remove(old) {
-            // 迁移过期时间：先从旧键移除，再插入到新键
             let expire = self.expires.remove(old).map(|(_, e)| e);
-            self.data.insert(new.clone(), val);
+            self.data.insert(new.to_vec(), val);
             if let Some(exp) = expire {
-                self.expires.insert(new, exp);
+                self.expires.insert(new.to_vec(), exp);
             }
             true
         } else {
@@ -306,7 +302,7 @@ impl Database {
         if self.data.contains_key(new) {
             false
         } else {
-            self.rename(old, new.to_vec())
+            self.rename(old, new)
         }
     }
 
@@ -600,7 +596,7 @@ mod tests {
     fn test_database_set_get() {
         let db = Database::new(0);
         db.set(
-            b"key".to_vec(),
+            b"key",
             RedisObject::String(b"value".to_vec()),
             None,
         );
@@ -615,7 +611,7 @@ mod tests {
     #[test]
     fn test_database_delete() {
         let db = Database::new(0);
-        db.set(b"k".to_vec(), RedisObject::Integer(42), None);
+        db.set(b"k", RedisObject::Integer(42), None);
         assert!(db.delete(b"k"));
         assert!(!db.exists(b"k"));
     }
@@ -635,11 +631,11 @@ mod tests {
         let mut rdb = RedisDb::new(16);
         // 在 db 0 中设置 k=1
         rdb.current_mut()
-            .set(b"k".to_vec(), RedisObject::Integer(1), None);
+            .set(b"k", RedisObject::Integer(1), None);
         // 切换到 db 1，设置 k=2
         rdb.select(1).unwrap();
         rdb.current_mut()
-            .set(b"k".to_vec(), RedisObject::Integer(2), None);
+            .set(b"k", RedisObject::Integer(2), None);
 
         // 切回 db 0，验证 k 的值仍为 1
         rdb.select(0).unwrap();

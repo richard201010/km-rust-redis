@@ -47,7 +47,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream};
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, RwLock};
 
 // ===========================================================================
 // CLI 命令行参数定义
@@ -109,8 +109,8 @@ struct Args {
 // - shutdown: 关闭标志位，用于优雅停机
 
 struct ServerState {
-    /// 数据库实例（用 Mutex 保护并发写入）
-    db: Mutex<RedisDb>,
+    /// 数据库实例（用 RwLock 保护：读命令不互斥，写命令独占）
+    db: RwLock<RedisDb>,
     /// 命令表：命令名（小写）→ 命令定义（arity 约束 + handler 函数指针）
     commands: HashMap<String, CommandDef>,
     /// 客户端 ID 原子递增计数器
@@ -136,7 +136,7 @@ impl ServerState {
     /// 初始化命令表、原子计数器、数据库连接池等。
     fn new(args: &Args) -> Self {
         Self {
-            db: Mutex::new(RedisDb::new(args.databases)),
+            db: RwLock::new(RedisDb::new(args.databases)),
             commands: build_command_table(),
             client_id: AtomicU64::new(1),
             total_connections: AtomicU64::new(0),
@@ -160,6 +160,13 @@ impl ServerState {
 // 4. 进入主循环：从 socket 读取数据 → 喂入 RESP 解析器 → 逐条处理命令
 // 5. 支持的内联命令（不走命令表）：AUTH、SELECT、QUIT、MULTI/EXEC/DISCARD、PING
 // 6. 其他命令统一走 execute_command 进行命令表查找 + arity 校验 + handler 调用
+
+
+/// 零分配命令名字节比较：忽略大小写比较两个字节切片
+#[inline(always)]
+fn cmd_eq(a: &[u8], b: &[u8]) -> bool {
+    a.len() == b.len() && a.eq_ignore_ascii_case(b)
+}
 
 async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u64) {
     // 获取对端地址用于日志，失败则标记为 "unknown"
@@ -243,13 +250,16 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             }
 
             // 提取命令名并转为小写（Redis 命令不区分大小写）
-            let cmd_name = String::from_utf8_lossy(&argv[0]).to_ascii_lowercase();
+            // 零分配命令名匹配：直接用字节比较，避免 UTF-8 校验 + String 分配
+            let cmd_bytes = argv[0].as_slice();
+            let cmd_len = cmd_bytes.len();
+            let cmd_lower: Vec<u8> = cmd_bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
             // 递增全局命令执行计数
             state.total_commands.fetch_add(1, Ordering::Relaxed);
 
             // ------- AUTH 认证检查 -------
             // 未认证状态下只允许 AUTH 和 QUIT 命令，其余一律拒绝
-            if !authenticated && cmd_name != "auth" && cmd_name != "quit" {
+            if !authenticated && !cmd_eq(cmd_bytes, b"auth") && !cmd_eq(cmd_bytes, b"quit") {
                 let reply = RespValue::err("NOAUTH Authentication required");
                 reply.encode_fast_into(&mut write_buf);
                 continue;
@@ -257,10 +267,10 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
 
             // ------- SELECT 切换数据库 -------
             // 选择指定编号的逻辑数据库（0 到 databases-1）
-            if cmd_name == "select" {
+            if cmd_eq(cmd_bytes, b"select") {
                 if let Some(db_str) = argv.get(1) {
                     if let Ok(new_db) = String::from_utf8_lossy(db_str).parse::<u8>() {
-                        let db = state.db.lock().await;
+                        let db = state.db.write().await;
                         if (new_db as usize) < db.databases.len() {
                             db_id = new_db;
                             let reply = RespValue::ok();
@@ -276,7 +286,7 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
 
             // ------- QUIT 断开连接 -------
             // 回复 OK 后直接返回，tokio 任务结束即释放连接资源
-            if cmd_name == "quit" {
+            if cmd_eq(cmd_bytes, b"quit") {
                 let reply = RespValue::ok();
                 reply.encode_fast_into(&mut write_buf);
                 let _ = writer.write_all(&write_buf).await;
@@ -287,7 +297,7 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             // ------- AUTH 密码认证 -------
             // 服务器未设密码时拒绝 AUTH（Redis 行为一致）
             // 设密码时校验客户端传入的密码是否匹配
-            if cmd_name == "auth" {
+            if cmd_eq(cmd_bytes, b"auth") {
                 if state.password.is_empty() {
                     let reply = RespValue::err("ERR Client sent AUTH, but no password is set");
                     reply.encode_fast_into(&mut write_buf);
@@ -310,7 +320,7 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
 
             // ------- MULTI 开启事务 -------
             // 标记进入事务模式，清空事务队列，后续命令入队而非立即执行
-            if cmd_name == "multi" {
+            if cmd_eq(cmd_bytes, b"multi") {
                 in_transaction = true;
                 transaction_queue.clear();
                 let reply = RespValue::ok();
@@ -321,7 +331,7 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             // ------- EXEC 执行事务 -------
             // 必须在 MULTI 之后调用，否则报错。
             // 按入队顺序逐条执行队列中的命令，收集结果后以数组形式返回。
-            if cmd_name == "exec" {
+            if cmd_eq(cmd_bytes, b"exec") {
                 if !in_transaction {
                     let reply = RespValue::err("ERR EXEC without MULTI");
                     reply.encode_fast_into(&mut write_buf);
@@ -341,7 +351,7 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
 
             // ------- DISCARD 取消事务 -------
             // 清空事务队列，退出事务模式
-            if cmd_name == "discard" {
+            if cmd_eq(cmd_bytes, b"discard") {
                 if !in_transaction {
                     let reply = RespValue::err("ERR DISCARD without MULTI");
                     reply.encode_fast_into(&mut write_buf);
@@ -367,7 +377,7 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             // ------- PING 心跳检测（Pub/Sub 兼容格式）-------
             // 普通模式返回 SimpleString("PONG")，这里按 Pub/Sub 规范返回数组格式
             // [b"pong", b"参数"]，与 Redis 订阅模式下的 PING 行为一致
-            if cmd_name == "ping" {
+            if cmd_eq(cmd_bytes, b"ping") {
                 let reply = if argv.len() > 1 {
                     RespValue::Array(vec![
                         RespValue::BulkString(b"pong".to_vec()),
@@ -385,8 +395,8 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
 
             // ------- SAVE/BGSAVE 拦截 -------
             // 在执行命令前拦截 SAVE/BGSAVE，直接操作数据库锁执行 RDB 快照
-            if cmd_name == "save" {
-                let db = state.db.lock().await;
+            if cmd_eq(cmd_bytes, b"save") {
+                let db = state.db.read().await;
                 let reply = match rdb::save_snapshot(&db, "dump.rdb") {
                     Ok(()) => RespValue::ok(),
                     Err(e) => RespValue::err(format!("ERR SAVE failed: {}", e)),
@@ -394,10 +404,10 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                 reply.encode_fast_into(&mut write_buf);
                 continue;
             }
-            if cmd_name == "bgsave" {
+            if cmd_eq(cmd_bytes, b"bgsave") {
                 let bg_state = Arc::clone(&state);
                 tokio::spawn(async move {
-                    let db = bg_state.db.lock().await;
+                    let db = bg_state.db.read().await;
                     if let Err(e) = rdb::save_snapshot(&db, "dump.rdb") {
                         log::error!("BGSAVE failed: {}", e);
                     } else {
@@ -414,7 +424,7 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             let result = execute_command(&state, db_id, argv.clone(), false).await;
 
             // ------- AOF 写入：写命令执行成功后追加到 AOF -------
-            if let Some(cmd_def) = state.commands.get(&cmd_name) {
+            if let Some(cmd_def) = state.commands.get(&cmd_lower.iter().map(|&b| (b as char).to_ascii_lowercase()).collect::<String>()) {
                 if cmd_def.flags & commands::CMD_WRITE != 0 {
                     // 只有执行成功（非 ERR 响应）才写 AOF
                     if !matches!(&result, RespValue::Error(_)) {
@@ -457,16 +467,18 @@ async fn execute_command(
     argv: Vec<Vec<u8>>,
     resp3: bool,
 ) -> RespValue {
-    // 提取命令名并转为小写
-    let cmd_name = String::from_utf8_lossy(&argv[0]).to_ascii_lowercase();
+    // 零分配命令名查找：直接用字节比较内联命令，避免 String 分配
+    let cmd_bytes = argv[0].as_slice();
 
     // 在命令表中查找：未注册的命令返回 ERR unknown command
-    let cmd = match state.commands.get(&cmd_name) {
+    // build_command_table 中 key 已是 lowercase，所以 argv[0] 也转 lowercase 做 lookup
+    let cmd_lower: Vec<u8> = cmd_bytes.iter().map(|b| b.to_ascii_lowercase()).collect();
+    let cmd = match state.commands.get(&cmd_lower.iter().map(|&b| (b as char).to_ascii_lowercase()).collect::<String>()) {
         Some(cmd) => cmd,
         None => {
             return RespValue::err(format!(
                 "ERR unknown command '{}', with args beginning with: {}",
-                cmd_name,
+                String::from_utf8_lossy(cmd_bytes),
                 String::from_utf8_lossy(argv.get(1).unwrap_or(&vec![]))
             ));
         }
@@ -481,29 +493,30 @@ async fn execute_command(
     if expected > 0 && argc != expected {
         return RespValue::err(format!(
             "ERR wrong number of arguments for '{}' command",
-            cmd_name
+            String::from_utf8_lossy(&cmd_bytes)
         ));
     } else if expected < 0 && argc < -expected {
         return RespValue::err(format!(
             "ERR wrong number of arguments for '{}' command",
-            cmd_name
+            String::from_utf8_lossy(&cmd_bytes)
         ));
     }
 
-    // 获取数据库锁，拿到指定逻辑数据库的引用
-    let db_guard = state.db.lock().await;
-    let db_ref = db_guard.get_db(db_id);
-
-    // 构建命令执行上下文，包含数据库引用、DB 索引、参数列表、RESP 版本标志
-    let ctx = CmdCtx {
-        db: db_ref,
-        db_id,
-        argv,
-        resp3,
-    };
-
-    // 通过函数指针调用具体的命令处理函数
-    (cmd.handler)(&ctx)
+    // 读命令用读锁（不互斥），写命令用写锁（独占）
+    // 大部分命令是读操作，RwLock 可大幅提升并发性能
+    if cmd.flags & commands::CMD_WRITE != 0 {
+        // 写命令：获取写锁
+        let mut db_guard = state.db.write().await;
+        let db_ref = db_guard.get_db(db_id);
+        let ctx = CmdCtx { db: db_ref, db_id, argv, resp3 };
+        (cmd.handler)(&ctx)
+    } else {
+        // 读命令：获取读锁（多个读命令可并行执行）
+        let db_guard = state.db.read().await;
+        let db_ref = db_guard.get_db(db_id);
+        let ctx = CmdCtx { db: db_ref, db_id, argv, resp3 };
+        (cmd.handler)(&ctx)
+    }
 }
 
 // ===========================================================================
@@ -517,7 +530,7 @@ async fn active_expire_loop(state: Arc<ServerState>) {
     loop {
         // 每秒执行一次过期扫描
         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-        let mut db = state.db.lock().await;
+        let mut db = state.db.write().await;
         // 遍历所有逻辑数据库，逐个执行主动过期
         for i in 0..db.databases.len() {
             let db_ref = &db.databases[i];
@@ -572,7 +585,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
 
     // ------- 启动时加载 RDB 持久化数据 -------
     {
-        let mut db = state.db.lock().await;
+        let mut db = state.db.write().await;
         if let Err(e) = rdb::restore_from_rdb(&mut db, "dump.rdb") {
             log::warn!("Failed to load RDB snapshot: {}", e);
         } else {
@@ -647,7 +660,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(std::time::Duration::from_secs(300)).await;
-            let db = rdb_state.db.lock().await;
+            let db = rdb_state.db.read().await;
             match rdb::save_snapshot(&db, "dump.rdb") {
                 Ok(()) => log::info!("Periodic RDB snapshot saved"),
                 Err(e) => log::error!("Periodic RDB snapshot failed: {}", e),

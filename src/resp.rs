@@ -25,6 +25,20 @@
 //!   <命令> <参数1> <参数2>\r\n → 解析为 Array(BulkString, ...)
 
 use bytes::{Buf, BytesMut};
+/// 零分配整数格式化：将 i64 写入缓冲区（利用 itoa 避免 String 分配）
+fn write_i64(buf: &mut Vec<u8>, n: i64) {
+    let mut tmp = ItoaBuf::new();
+    buf.extend_from_slice(tmp.format(n).as_bytes());
+}
+
+/// 零分配 usize 格式化：将 usize 写入缓冲区
+fn write_usize(buf: &mut Vec<u8>, n: usize) {
+    let mut tmp = ItoaBuf::new();
+    buf.extend_from_slice(tmp.format(n).as_bytes());
+}
+
+use itoa::Buffer as ItoaBuf;
+use memchr::memchr;
 use std::fmt;
 
 /// RESP 值类型枚举，对应 Redis 协议中所有数据类型
@@ -239,7 +253,7 @@ impl RespValue {
             // 二进制安全字符串：$<长度>\r\n<数据>\r\n
             RespValue::BulkString(data) => {
                 buf.extend_from_slice(b"$");
-                buf.extend_from_slice(data.len().to_string().as_bytes());
+                write_usize(buf, data.len());
                 buf.extend_from_slice(b"\r\n");
                 buf.extend_from_slice(data);
                 buf.extend_from_slice(b"\r\n");
@@ -300,7 +314,7 @@ impl RespValue {
             RespValue::Map(pairs) => {
                 if resp3 {
                     buf.extend_from_slice(b"%");
-                    buf.extend_from_slice(pairs.len().to_string().as_bytes());
+                    write_usize(buf, pairs.len());
                     buf.extend_from_slice(b"\r\n");
                     for (k, v) in pairs {
                         k.encode_into(buf, resp3);
@@ -754,10 +768,23 @@ impl RespParser {
 /// 用于 RESP 协议的行终止符定位。
 ///
 /// 注意：会检查 `i+1 < buf.len()`，因此不会越界访问。
+/// SIMD 加速的 CRLF 搜索：用 memchr 找 \r，然后验证后一字节是 \n
+/// memchr 内部使用 SSE2/AVX2 SIMD 指令，比手写循环快 3-8x
 fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
-    for i in start..buf.len() - 1 {
-        if buf[i] == b'\r' && buf[i + 1] == b'\n' {
-            return Some(i);
+    let data = &buf[start..];
+    let mut pos = 0;
+    while pos < data.len() {
+        // memchr 找到下一个 \r 的位置（SIMD 加速）
+        match memchr(b'\r', &data[pos..]) {
+            Some(offset) => {
+                let cr_pos = pos + offset;
+                // 验证下一个字节是 \n
+                if cr_pos + 1 < data.len() && data[cr_pos + 1] == b'\n' {
+                    return Some(start + cr_pos);
+                }
+                pos = cr_pos + 1;
+            }
+            None => return None,
         }
     }
     None
@@ -766,13 +793,9 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 /// 在字节缓冲区中查找 \n (LF) 的位置
 ///
 /// 仅用于 Inline 命令解析的后备方案，兼容只使用 LF 换行的客户端。
+/// SIMD 加速的 LF 搜索
 fn find_lf(buf: &[u8], start: usize) -> Option<usize> {
-    for i in start..buf.len() {
-        if buf[i] == b'\n' {
-            return Some(i);
-        }
-    }
-    None
+    memchr(b'\n', &buf[start..]).map(|offset| start + offset)
 }
 
 #[cfg(test)]

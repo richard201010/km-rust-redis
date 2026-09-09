@@ -766,7 +766,7 @@ fn cmd_rename(ctx: &CmdCtx) -> RespValue {
     if ctx.argv[1] == ctx.argv[2] {
         return RespValue::err("ERR src and dst keys are the same");
     }
-    if ctx.db.rename(&ctx.argv[1], ctx.argv[2].clone()) {
+    if ctx.db.rename(&ctx.argv[1], &ctx.argv[2]) {
         RespValue::ok()
     } else {
         RespValue::err("ERR no such key")
@@ -975,7 +975,7 @@ fn cmd_set(ctx: &CmdCtx) -> RespValue {
         Err(_) => RedisObject::String(value.clone()),
     };
 
-    ctx.db.set(key.clone(), obj, ex_ms);
+    ctx.db.set(&key, obj, ex_ms);
     RespValue::ok()
 }
 
@@ -984,7 +984,7 @@ fn cmd_setnx(ctx: &CmdCtx) -> RespValue {
         RespValue::Integer(0)
     } else {
         ctx.db.set(
-            ctx.argv[1].clone(),
+            &ctx.argv[1],
             RedisObject::String(ctx.argv[2].clone()),
             None,
         );
@@ -996,7 +996,7 @@ fn cmd_setex(ctx: &CmdCtx) -> RespValue {
     match ctx.arg_i64(2) {
         Some(secs) if secs > 0 => {
             ctx.db.set(
-                ctx.argv[1].clone(),
+            &ctx.argv[1],
                 RedisObject::String(ctx.argv[3].clone()),
                 Some(secs as u64 * 1000),
             );
@@ -1010,7 +1010,7 @@ fn cmd_psetex(ctx: &CmdCtx) -> RespValue {
     match ctx.arg_i64(2) {
         Some(ms) if ms > 0 => {
             ctx.db.set(
-                ctx.argv[1].clone(),
+            &ctx.argv[1],
                 RedisObject::String(ctx.argv[3].clone()),
                 Some(ms as u64),
             );
@@ -1042,7 +1042,7 @@ fn cmd_mset(ctx: &CmdCtx) -> RespValue {
     let mut i = 1;
     while i < ctx.argc() {
         ctx.db.set(
-            ctx.argv[i].clone(),
+            &ctx.argv[i],
             RedisObject::String(ctx.argv[i + 1].clone()),
             None,
         );
@@ -1066,7 +1066,7 @@ fn cmd_msetnx(ctx: &CmdCtx) -> RespValue {
     i = 1;
     while i < ctx.argc() {
         ctx.db.set(
-            ctx.argv[i].clone(),
+            &ctx.argv[i],
             RedisObject::String(ctx.argv[i + 1].clone()),
             None,
         );
@@ -1078,7 +1078,7 @@ fn cmd_msetnx(ctx: &CmdCtx) -> RespValue {
 fn cmd_getset(ctx: &CmdCtx) -> RespValue {
     let old = cmd_get(ctx);
     ctx.db.set(
-        ctx.argv[1].clone(),
+            &ctx.argv[1],
         RedisObject::String(ctx.argv[2].clone()),
         None,
     );
@@ -1091,7 +1091,7 @@ fn cmd_append(ctx: &CmdCtx) -> RespValue {
             d.extend_from_slice(&ctx.argv[2]);
             let len = d.len();
             ctx.db
-                .set(ctx.argv[1].clone(), RedisObject::String(d), None);
+                .set(&ctx.argv[1], RedisObject::String(d), None);
             len
         }
         Some(RedisObject::Integer(n)) => {
@@ -1099,12 +1099,12 @@ fn cmd_append(ctx: &CmdCtx) -> RespValue {
             d.extend_from_slice(&ctx.argv[2]);
             let len = d.len();
             ctx.db
-                .set(ctx.argv[1].clone(), RedisObject::String(d), None);
+                .set(&ctx.argv[1], RedisObject::String(d), None);
             len
         }
         None => {
             ctx.db.set(
-                ctx.argv[1].clone(),
+            &ctx.argv[1],
                 RedisObject::String(ctx.argv[2].clone()),
                 None,
             );
@@ -1149,7 +1149,7 @@ fn cmd_incrbyfloat(ctx: &CmdCtx) -> RespValue {
     let new_val = current + incr;
     let s = format!("{}", new_val);
     ctx.db.set(
-        ctx.argv[1].clone(),
+            &ctx.argv[1],
         RedisObject::String(s.into_bytes()),
         None,
     );
@@ -1215,7 +1215,7 @@ fn cmd_setrange(ctx: &CmdCtx) -> RespValue {
     data[offset..end].copy_from_slice(value);
     let new_len = data.len();
     ctx.db
-        .set(ctx.argv[1].clone(), RedisObject::String(data), None);
+        .set(&ctx.argv[1], RedisObject::String(data), None);
     RespValue::Integer(new_len as i64)
 }
 
@@ -1286,7 +1286,7 @@ fn cmd_setbit(ctx: &CmdCtx) -> RespValue {
         data[byte_idx] &= !(1 << bit_idx);
     }
     ctx.db
-        .set(ctx.argv[1].clone(), RedisObject::String(data), None);
+        .set(&ctx.argv[1], RedisObject::String(data), None);
     RespValue::Integer(old_val as i64)
 }
 
@@ -1417,7 +1417,7 @@ fn incr_decr(ctx: &CmdCtx, delta: i64) -> RespValue {
     };
     let new_val = current + delta;
     ctx.db.set(
-        ctx.argv[1].clone(),
+            &ctx.argv[1],
         RedisObject::Integer(new_val),
         expire_ms,
     );
@@ -1450,7 +1450,7 @@ fn cmd_lpush(ctx: &CmdCtx) -> RespValue {
                 list.push_front(ctx.argv[i].clone());
             }
             let len = list.len() as i64;
-            ctx.db.set(key.clone(), RedisObject::List(list), None);
+            ctx.db.set(&key, RedisObject::List(list), None);
             RespValue::Integer(len)
         }
     }
@@ -1474,7 +1474,7 @@ fn cmd_rpush(ctx: &CmdCtx) -> RespValue {
                 list.push_back(ctx.argv[i].clone());
             }
             let len = list.len() as i64;
-            ctx.db.set(key.clone(), RedisObject::List(list), None);
+            ctx.db.set(&key, RedisObject::List(list), None);
             RespValue::Integer(len)
         }
     }
@@ -1699,7 +1699,7 @@ fn cmd_lrem(ctx: &CmdCtx) -> RespValue {
         ctx.db.delete(&ctx.argv[1]);
     } else {
         ctx.db
-            .set(ctx.argv[1].clone(), RedisObject::List(list), None);
+            .set(&ctx.argv[1], RedisObject::List(list), None);
     }
     RespValue::Integer(removed)
 }
@@ -1739,7 +1739,7 @@ fn cmd_ltrim(ctx: &CmdCtx) -> RespValue {
             ctx.db.delete(&ctx.argv[1]);
         } else {
             ctx.db
-                .set(ctx.argv[1].clone(), RedisObject::List(new_list), None);
+                .set(&ctx.argv[1], RedisObject::List(new_list), None);
         }
     }
     RespValue::ok()
@@ -1767,7 +1767,7 @@ fn cmd_linsert(ctx: &CmdCtx) -> RespValue {
             }
             let len = list.len() as i64;
             ctx.db
-                .set(ctx.argv[1].clone(), RedisObject::List(list), None);
+                .set(&ctx.argv[1], RedisObject::List(list), None);
             RespValue::Integer(len)
         }
         None => RespValue::Integer(-1),
@@ -1795,7 +1795,7 @@ fn cmd_rpoplpush(ctx: &CmdCtx) -> RespValue {
                 if l.is_empty() {
                     ctx.db.delete(&ctx.argv[1]);
                 } else {
-                    ctx.db.set(ctx.argv[1].clone(), RedisObject::List(l), None);
+                    ctx.db.set(&ctx.argv[1], RedisObject::List(l), None);
                 }
                 v
             }
@@ -1812,7 +1812,7 @@ fn cmd_rpoplpush(ctx: &CmdCtx) -> RespValue {
     };
     dest.push_front(val.clone());
     ctx.db
-        .set(ctx.argv[2].clone(), RedisObject::List(dest), None);
+        .set(&ctx.argv[2], RedisObject::List(dest), None);
     RespValue::BulkString(val)
 }
 
@@ -1831,7 +1831,7 @@ fn cmd_lmove(ctx: &CmdCtx) -> RespValue {
                     if l.is_empty() {
                         ctx.db.delete(&ctx.argv[1]);
                     } else {
-                        ctx.db.set(ctx.argv[1].clone(), RedisObject::List(l), None);
+                        ctx.db.set(&ctx.argv[1], RedisObject::List(l), None);
                     }
                     v
                 }
@@ -1852,7 +1852,7 @@ fn cmd_lmove(ctx: &CmdCtx) -> RespValue {
         dest.push_back(val.clone());
     }
     ctx.db
-        .set(ctx.argv[4].clone(), RedisObject::List(dest), None);
+        .set(&ctx.argv[4], RedisObject::List(dest), None);
     RespValue::BulkString(val)
 }
 
@@ -1891,7 +1891,7 @@ fn cmd_hset(ctx: &CmdCtx) -> RespValue {
                 added += 1;
                 i += 2;
             }
-            ctx.db.set(key.clone(), RedisObject::Hash(hash), None);
+            ctx.db.set(&key, RedisObject::Hash(hash), None);
             RespValue::Integer(added)
         }
     }
@@ -1932,7 +1932,7 @@ fn cmd_hmset(ctx: &CmdCtx) -> RespValue {
                 hash.insert(ctx.argv[i].clone(), ctx.argv[i + 1].clone());
                 i += 2;
             }
-            ctx.db.set(key.clone(), RedisObject::Hash(hash), None);
+            ctx.db.set(&key, RedisObject::Hash(hash), None);
             RespValue::ok()
         }
     }
@@ -2040,7 +2040,7 @@ fn cmd_hincrby(ctx: &CmdCtx) -> RespValue {
             let mut hash = HashMap::new();
             let new_val = incr;
             hash.insert(ctx.argv[2].clone(), new_val.to_string().into_bytes());
-            ctx.db.set(key.clone(), RedisObject::Hash(hash), None);
+            ctx.db.set(&key, RedisObject::Hash(hash), None);
             RespValue::Integer(new_val)
         }
     }
@@ -2072,7 +2072,7 @@ fn cmd_hincrbyfloat(ctx: &CmdCtx) -> RespValue {
             let new_val = incr;
             let s = format!("{}", new_val);
             hash.insert(ctx.argv[2].clone(), s.clone().into_bytes());
-            ctx.db.set(key.clone(), RedisObject::Hash(hash), None);
+            ctx.db.set(&key, RedisObject::Hash(hash), None);
             RespValue::BulkString(s.into_bytes())
         }
     }
@@ -2120,7 +2120,7 @@ fn cmd_hsetnx(ctx: &CmdCtx) -> RespValue {
         None => {
             let mut hash = HashMap::new();
             hash.insert(ctx.argv[2].clone(), ctx.argv[3].clone());
-            ctx.db.set(key.clone(), RedisObject::Hash(hash), None);
+            ctx.db.set(&key, RedisObject::Hash(hash), None);
             RespValue::Integer(1)
         }
     }
@@ -2211,7 +2211,7 @@ fn cmd_sadd(ctx: &CmdCtx) -> RespValue {
                     added += 1;
                 }
             }
-            ctx.db.set(key.clone(), RedisObject::Set(set), None);
+            ctx.db.set(&key, RedisObject::Set(set), None);
             RespValue::Integer(added)
         }
     }
@@ -2373,7 +2373,7 @@ fn cmd_spop(ctx: &CmdCtx) -> RespValue {
     if set.is_empty() {
         ctx.db.delete(&ctx.argv[1]);
     } else {
-        ctx.db.set(ctx.argv[1].clone(), RedisObject::Set(set), None);
+        ctx.db.set(&ctx.argv[1], RedisObject::Set(set), None);
     }
     if count == 1 && !result.is_empty() {
         result.pop().unwrap()
@@ -2511,7 +2511,7 @@ fn cmd_zadd(ctx: &CmdCtx) -> RespValue {
                 added += 1;
                 i += 2;
             }
-            ctx.db.set(key.clone(), RedisObject::ZSet(zset), None);
+            ctx.db.set(&key, RedisObject::ZSet(zset), None);
             if ch {
                 RespValue::Integer(added)
             } else {
@@ -2716,7 +2716,7 @@ fn cmd_zincrby(ctx: &CmdCtx) -> RespValue {
             let mut zset = ZSet::new();
             let new_score = incr; // current is 0.0 for new key
             zset.add(ctx.argv[3].clone(), new_score);
-            ctx.db.set(key.clone(), RedisObject::ZSet(zset), None);
+            ctx.db.set(&key, RedisObject::ZSet(zset), None);
             RespValue::BulkString(format!("{}", new_score).into_bytes())
         }
     }
@@ -3015,7 +3015,7 @@ fn cmd_bitop(ctx: &CmdCtx) -> RespValue {
         _ => return RespValue::err("ERR syntax error"),
     }
     let len = result.len() as i64;
-    ctx.db.set(destkey.clone(), RedisObject::String(result), None);
+    ctx.db.set(&destkey, RedisObject::String(result), None);
     RespValue::Integer(len)
 }
 
@@ -3106,7 +3106,7 @@ fn cmd_blmove(ctx: &CmdCtx) -> RespValue {
         None => {
             let mut l = VecDeque::new();
             if dst_dir == "LEFT" { l.push_front(val.clone()); } else { l.push_back(val.clone()); }
-            ctx.db.set(dst.clone(), RedisObject::List(l), None);
+            ctx.db.set(&dst, RedisObject::List(l), None);
         }
     }
     RespValue::BulkString(val)
@@ -3491,7 +3491,7 @@ fn cmd_geoadd(ctx: &CmdCtx) -> RespValue {
         if zset.add(member, score) { added += 1; }
         i += 3;
     }
-    ctx.db.set(ctx.argv[1].clone(), RedisObject::ZSet(zset), None);
+    ctx.db.set(&ctx.argv[1], RedisObject::ZSet(zset), None);
     RespValue::Integer(added)
 }
 
@@ -3607,7 +3607,7 @@ fn cmd_pfadd(ctx: &CmdCtx) -> RespValue {
     for i in 2..ctx.argc() {
         if set.insert(ctx.argv[i].clone()) { added += 1; }
     }
-    ctx.db.set(ctx.argv[1].clone(), RedisObject::Set(set), None);
+    ctx.db.set(&ctx.argv[1], RedisObject::Set(set), None);
     RespValue::Integer(if added > 0 { 1 } else { 0 })
 }
 
@@ -3628,7 +3628,7 @@ fn cmd_pfmerge(ctx: &CmdCtx) -> RespValue {
             merged.extend(s);
         }
     }
-    ctx.db.set(ctx.argv[1].clone(), RedisObject::Set(merged), None);
+    ctx.db.set(&ctx.argv[1], RedisObject::Set(merged), None);
     RespValue::ok()
 }
 
@@ -4117,7 +4117,7 @@ fn cmd_hgetdel(ctx: &CmdCtx) -> RespValue {
                 });
                 remaining.remove(&ctx.argv[i]);
             }
-            ctx.db.set(key.clone(), RedisObject::Hash(remaining), None);
+            ctx.db.set(&key, RedisObject::Hash(remaining), None);
             RespValue::Array(result)
         }
         Some(_) => RespValue::err("WRONGTYPE"),
@@ -4193,7 +4193,7 @@ fn cmd_hsetex(ctx: &CmdCtx) -> RespValue {
             count += 1;
         }
     }
-    ctx.db.set(key.clone(), RedisObject::Hash(h), None);
+    ctx.db.set(&key, RedisObject::Hash(h), None);
     RespValue::Integer(count)
 }
 
@@ -4222,7 +4222,7 @@ fn cmd_himport(ctx: &CmdCtx) -> RespValue {
         h.insert(ctx.argv[j].clone(), ctx.argv[j + 1].clone());
         j += 2;
     }
-    ctx.db.set(key.clone(), RedisObject::Hash(h), None);
+    ctx.db.set(&key, RedisObject::Hash(h), None);
     RespValue::ok()
 }
 
@@ -4465,7 +4465,7 @@ fn cmd_xadd(ctx: &CmdCtx) -> RespValue {
     }
     match stream.add(fields, id, limit, false) {
         Ok(new_id) => {
-            ctx.db.set(key.clone(), RedisObject::Stream(stream), None);
+            ctx.db.set(&key, RedisObject::Stream(stream), None);
             RespValue::BulkString(format!("{}-{}", new_id.timestamp, new_id.sequence).into_bytes())
         }
         Err(e) => RespValue::err(e),
@@ -4624,7 +4624,7 @@ fn cmd_sdiffstore(ctx: &CmdCtx) -> RespValue {
         }
     }
     let len = result.len() as i64;
-    ctx.db.set(ctx.argv[1].clone(), RedisObject::Set(result), None);
+    ctx.db.set(&ctx.argv[1], RedisObject::Set(result), None);
     RespValue::Integer(len)
 }
 
@@ -4632,7 +4632,7 @@ fn cmd_sinterstore(ctx: &CmdCtx) -> RespValue {
     let first = match ctx.db.get(&ctx.argv[2]) {
         Some(RedisObject::Set(s)) => s,
         Some(_) => return RespValue::err("WRONGTYPE"),
-        None => { ctx.db.set(ctx.argv[1].clone(), RedisObject::Set(std::collections::HashSet::new()), None); return RespValue::Integer(0); }
+        None => { ctx.db.set(&ctx.argv[1], RedisObject::Set(std::collections::HashSet::new()), None); return RespValue::Integer(0); }
     };
     let mut result = first;
     for i in 3..ctx.argc() {
@@ -4643,7 +4643,7 @@ fn cmd_sinterstore(ctx: &CmdCtx) -> RespValue {
         }
     }
     let len = result.len() as i64;
-    ctx.db.set(ctx.argv[1].clone(), RedisObject::Set(result), None);
+    ctx.db.set(&ctx.argv[1], RedisObject::Set(result), None);
     RespValue::Integer(len)
 }
 
@@ -4653,7 +4653,7 @@ fn cmd_sunionstore(ctx: &CmdCtx) -> RespValue {
         if let Some(RedisObject::Set(s)) = ctx.db.get(&ctx.argv[i]) { result.extend(s); }
     }
     let len = result.len() as i64;
-    ctx.db.set(ctx.argv[1].clone(), RedisObject::Set(result), None);
+    ctx.db.set(&ctx.argv[1], RedisObject::Set(result), None);
     RespValue::Integer(len)
 }
 
@@ -4662,7 +4662,7 @@ fn cmd_zdiffstore(ctx: &CmdCtx) -> RespValue {
     let first = match ctx.db.get(&ctx.argv[3]) {
         Some(RedisObject::ZSet(z)) => z,
         Some(_) => return RespValue::err("WRONGTYPE"),
-        None => { ctx.db.set(ctx.argv[1].clone(), RedisObject::ZSet(ZSet::new()), None); return RespValue::Integer(0); }
+        None => { ctx.db.set(&ctx.argv[1], RedisObject::ZSet(ZSet::new()), None); return RespValue::Integer(0); }
     };
     let mut result_set: std::collections::HashSet<Vec<u8>> = first.dict.keys().cloned().collect();
     for i in 4..3 + numkeys {
@@ -4673,7 +4673,7 @@ fn cmd_zdiffstore(ctx: &CmdCtx) -> RespValue {
     let mut zset = ZSet::new();
     for m in result_set { if let Some(s) = first.score(&m) { zset.add(m, s); } }
     let len = zset.len() as i64;
-    ctx.db.set(ctx.argv[1].clone(), RedisObject::ZSet(zset), None);
+    ctx.db.set(&ctx.argv[1], RedisObject::ZSet(zset), None);
     RespValue::Integer(len)
 }
 
@@ -4682,7 +4682,7 @@ fn cmd_zinterstore(ctx: &CmdCtx) -> RespValue {
     let first = match ctx.db.get(&ctx.argv[3]) {
         Some(RedisObject::ZSet(z)) => z,
         Some(_) => return RespValue::err("WRONGTYPE"),
-        None => { ctx.db.set(ctx.argv[1].clone(), RedisObject::ZSet(ZSet::new()), None); return RespValue::Integer(0); }
+        None => { ctx.db.set(&ctx.argv[1], RedisObject::ZSet(ZSet::new()), None); return RespValue::Integer(0); }
     };
     let mut result: std::collections::HashMap<Vec<u8>, f64> = first.dict.iter().map(|(m, s)| (m.clone(), s.0)).collect();
     for i in 4..3 + numkeys {
@@ -4695,7 +4695,7 @@ fn cmd_zinterstore(ctx: &CmdCtx) -> RespValue {
     let mut zset = ZSet::new();
     for (m, s) in result { zset.add(m, s); }
     let len = zset.len() as i64;
-    ctx.db.set(ctx.argv[1].clone(), RedisObject::ZSet(zset), None);
+    ctx.db.set(&ctx.argv[1], RedisObject::ZSet(zset), None);
     RespValue::Integer(len)
 }
 
@@ -4710,7 +4710,7 @@ fn cmd_zunionstore(ctx: &CmdCtx) -> RespValue {
     let mut zset = ZSet::new();
     for (m, s) in result { zset.add(m, s); }
     let len = zset.len() as i64;
-    ctx.db.set(ctx.argv[1].clone(), RedisObject::ZSet(zset), None);
+    ctx.db.set(&ctx.argv[1], RedisObject::ZSet(zset), None);
     RespValue::Integer(len)
 }
 
@@ -4832,7 +4832,7 @@ fn cmd_smove(ctx: &CmdCtx) -> RespValue {
         None => std::collections::HashSet::new(),
     };
     dst_set.insert(member.clone());
-    ctx.db.set(dst.clone(), RedisObject::Set(dst_set), None);
+    ctx.db.set(&dst, RedisObject::Set(dst_set), None);
     RespValue::Integer(1)
 }
 
@@ -4888,7 +4888,7 @@ fn cmd_copy(ctx: &CmdCtx) -> RespValue {
     let replace = ctx.arg_str(3).map(|s| s.eq_ignore_ascii_case("REPLACE")).unwrap_or(false);
     if !replace && ctx.db.exists(dst) { return RespValue::Integer(0); }
     match ctx.db.get(src) {
-        Some(val) => { ctx.db.set(dst.clone(), val, None); RespValue::Integer(1) }
+        Some(val) => { ctx.db.set(&dst, val, None); RespValue::Integer(1) }
         None => RespValue::Integer(0),
     }
 }

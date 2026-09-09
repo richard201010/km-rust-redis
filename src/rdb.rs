@@ -371,7 +371,7 @@ pub fn restore_from_rdb(rdb: &mut RedisDb, path: &str) -> io::Result<()> {
     let data = load_snapshot(path)?;
     let db = &rdb.databases[0];
     for (key, value) in data {
-        db.set(key, value, None);
+        db.set(&key, value, None);
     }
     Ok(())
 }
@@ -386,11 +386,11 @@ mod tests {
         let path = "/tmp/test_rdb_string.rdb";
         let mut rdb = RedisDb::new(1);
         rdb.databases[0].set(
-            b"hello".to_vec(),
+            b"hello",
             RedisObject::String(b"world".to_vec()),
             None,
         );
-        rdb.databases[0].set(b"number".to_vec(), RedisObject::Integer(42), None);
+        rdb.databases[0].set(b"number", RedisObject::Integer(42), None);
 
         save_snapshot(&rdb, path).unwrap();
         let loaded = load_snapshot(path).unwrap();
@@ -416,7 +416,7 @@ mod tests {
         list.push_back(b"a".to_vec());
         list.push_back(b"b".to_vec());
         list.push_back(b"c".to_vec());
-        rdb.databases[0].set(b"mylist".to_vec(), RedisObject::List(list), None);
+        rdb.databases[0].set(b"mylist", RedisObject::List(list), None);
 
         save_snapshot(&rdb, path).unwrap();
         let loaded = load_snapshot(path).unwrap();
@@ -441,7 +441,7 @@ mod tests {
         let mut hash = HashMap::new();
         hash.insert(b"f1".to_vec(), b"v1".to_vec());
         hash.insert(b"f2".to_vec(), b"v2".to_vec());
-        rdb.databases[0].set(b"myhash".to_vec(), RedisObject::Hash(hash), None);
+        rdb.databases[0].set(b"myhash", RedisObject::Hash(hash), None);
 
         save_snapshot(&rdb, path).unwrap();
         let loaded = load_snapshot(path).unwrap();
@@ -464,7 +464,7 @@ mod tests {
         let mut set = HashSet::new();
         set.insert(b"m1".to_vec());
         set.insert(b"m2".to_vec());
-        rdb.databases[0].set(b"myset".to_vec(), RedisObject::Set(set), None);
+        rdb.databases[0].set(b"myset", RedisObject::Set(set), None);
 
         save_snapshot(&rdb, path).unwrap();
         let loaded = load_snapshot(path).unwrap();
@@ -487,7 +487,7 @@ mod tests {
         let mut zset = ZSet::new();
         zset.add(b"alice".to_vec(), 1.0);
         zset.add(b"bob".to_vec(), 2.5);
-        rdb.databases[0].set(b"myzset".to_vec(), RedisObject::ZSet(zset), None);
+        rdb.databases[0].set(b"myzset", RedisObject::ZSet(zset), None);
 
         save_snapshot(&rdb, path).unwrap();
         let loaded = load_snapshot(path).unwrap();
@@ -525,11 +525,11 @@ mod tests {
         let path = "/tmp/test_rdb_restore.rdb";
         let mut rdb = RedisDb::new(1);
         rdb.databases[0].set(
-            b"key1".to_vec(),
+            b"key1",
             RedisObject::String(b"val1".to_vec()),
             None,
         );
-        rdb.databases[0].set(b"key2".to_vec(), RedisObject::Integer(99), None);
+        rdb.databases[0].set(b"key2", RedisObject::Integer(99), None);
         save_snapshot(&rdb, path).unwrap();
 
         // 创建新的 RedisDb 并恢复
