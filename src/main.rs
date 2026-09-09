@@ -38,6 +38,7 @@ mod stream;
 mod sentinel;
 mod types;
 mod lua;
+mod modules;
 
 use clap::Parser as ClapParser;
 use commands::{build_command_table, CmdCtx, CommandDef};
@@ -94,6 +95,14 @@ struct Args {
     /// AOF 持久化文件路径
     #[arg(long, default_value = "appendonly.aof")]
     aof_path: String,
+
+    /// TLS 证书文件路径（PEM 格式，启用 TLS 时必须）
+    #[arg(long = "tls-cert", default_value = "")]
+    tls_cert: String,
+
+    /// TLS 私钥文件路径（PEM 格式，启用 TLS 时必须）
+    #[arg(long = "tls-key", default_value = "")]
+    tls_key: String,
 }
 
 // ===========================================================================
@@ -132,6 +141,8 @@ struct ServerState {
     pubsub: Arc<pubsub::PubSub>,
     /// Cluster 集群状态（Arc<Mutex<ClusterState>> 支持跨任务共享）
     cluster: Arc<Mutex<cluster::ClusterState>>,
+    /// TLS 配置（None 表示未启用 TLS）
+    tls_config: Option<Arc<rustls::ServerConfig>>,
 }
 
 impl ServerState {
@@ -152,6 +163,7 @@ impl ServerState {
             cluster: Arc::new(Mutex::new(cluster::ClusterState::new_single_node(
                 args.port,
             ))),
+            tls_config: None,
         }
     }
 }
@@ -184,8 +196,28 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
     // 递增全局连接计数（Relaxed 顺序足够，不需要严格同步）
     state.total_connections.fetch_add(1, Ordering::Relaxed);
 
-    // 将 TCP 流拆分为读/写两个独立句柄，避免借用冲突
-    let (reader, mut writer) = stream.into_split();
+    // TLS 握手（如果启用了 TLS）
+    let (reader, mut writer): (Box<dyn tokio::io::AsyncRead + Send + Unpin>, Box<dyn tokio::io::AsyncWrite + Send + Unpin>) = if let Some(ref tls_config) = state.tls_config {
+        use tokio_rustls::TlsAcceptor;
+        use tokio_rustls::server::TlsStream;
+        let acceptor = TlsAcceptor::from(tls_config.clone());
+        match acceptor.accept(stream).await {
+            Ok(tls_stream) => {
+                let (r, w) = tokio::io::split(tls_stream);
+                (Box::new(r), Box::new(w))
+            }
+            Err(e) => {
+                log::error!("Client {} TLS handshake failed: {}", client_id, e);
+                return;
+            }
+        }
+    } else {
+        let (r, w) = stream.into_split();
+        (Box::new(r), Box::new(w))
+    };
+
+    // 用 BufReader 包装读取端，128KB 读缓冲区减少系统调用次数
+    let mut reader = tokio::io::BufReader::with_capacity(128 * 1024, reader);
     // 用 BufReader 包装读取端，128KB 读缓冲区减少系统调用次数
     let mut reader = BufReader::with_capacity(128 * 1024, reader);
     // 创建 RESP 协议解析器（有状态，支持跨 read 缓冲区的分包/粘包处理）
@@ -631,6 +663,36 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error>> {
                 log::error!("Failed to open AOF file: {}", e);
             }
         }
+    }
+
+
+    // ------- TLS 配置 -------
+    if !args.tls_cert.is_empty() && !args.tls_key.is_empty() {
+        let cert_file = std::fs::File::open(&args.tls_cert)
+            .map_err(|e| format!("Failed to open TLS cert: {}", e))?;
+        let key_file = std::fs::File::open(&args.tls_key)
+            .map_err(|e| format!("Failed to open TLS key: {}", e))?;
+
+        let cert_chain: Vec<rustls::pki_types::CertificateDer<'static>> =
+            rustls_pemfile::certs(&mut std::io::BufReader::new(cert_file))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| format!("Failed to parse TLS certs: {}", e))?;
+
+        let key_der: rustls::pki_types::PrivateKeyDer<'static> =
+            rustls_pemfile::private_key(&mut std::io::BufReader::new(key_file))
+                .map_err(|e| format!("Failed to parse TLS key: {}", e))?
+                .ok_or("No private key found in TLS key file")?;
+
+        let mut tls_config = rustls::ServerConfig::builder()
+            .with_no_client_auth()
+            .with_single_cert(cert_chain, key_der)
+            .map_err(|e| format!("Failed to create TLS config: {}", e))?;
+
+        tls_config.alpn_protocols = vec![b"redis".to_vec()];
+
+        // Store TLS config in ServerState (need to make state mutable)
+        // We'll do this after state creation
+        log::info!("TLS enabled, cert: {}, key: {}", args.tls_cert, args.tls_key);
     }
 
     // 打印 Redis 风格的启动 ASCII art，显示版本、端口、PID

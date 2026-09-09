@@ -512,8 +512,69 @@ impl Sentinel {
             // SENTINEL info — 返回 INFO sentinel 格式
             "info" => RespValue::bulk(self.info_sentinel()),
 
+            // SENTINEL failover <master-name>
+            "failover" => {
+                if argv.len() < 3 {
+                    return RespValue::err("ERR wrong number of arguments for 'sentinel|failover' command");
+                }
+                let name = match std::str::from_utf8(&argv[2]) {
+                    Ok(s) => s,
+                    Err(_) => return RespValue::err("ERR invalid master name"),
+                };
+                match self.failover(name) {
+                    Ok(_) => RespValue::ok(),
+                    Err(e) => RespValue::err(e),
+                }
+            }
+
             _ => RespValue::err(&format!("ERR unknown sentinel subcommand '{}'", subcmd)),
         }
+    }
+
+    /// 触发故障转移：将最佳从节点提升为新主节点
+    pub fn failover(&mut self, master_name: &str) -> Result<String, String> {
+        let master = self.monitor_masters.get(master_name)
+            .ok_or_else(|| format!("ERR Master '{}' not found", master_name))?;
+
+        if !master.is_odown {
+            return Err("ERR Master is not in ODOWN state".to_string());
+        }
+
+        if master.slaves.is_empty() {
+            return Err("ERR No slaves available for failover".to_string());
+        }
+
+        // 选择最佳从节点
+        let best_slave = &master.slaves[0];
+        let new_master_addr = best_slave.addr.clone();
+        let new_master_name = best_slave.name.clone();
+
+        // 更新主节点地址
+        let master = self.monitor_masters.get_mut(master_name).unwrap();
+        master.addr = new_master_addr.clone();
+        master.is_sdown = false;
+        master.is_odown = false;
+        master.last_pong = current_time_ms();
+        master.last_ok = current_time_ms();
+
+        log::info!("FAILOVER: '{}' promoted to master", new_master_name);
+        Ok(new_master_addr)
+    }
+
+    /// 自动故障转移检查：检测 ODOWN 并触发 failover
+    pub fn auto_failover_check(&mut self) -> Vec<String> {
+        let mut failed_over = Vec::new();
+        let names: Vec<String> = self.monitor_masters.keys().cloned().collect();
+        for name in names {
+            if let Some(status) = self.check_master(&name) {
+                if status.is_odown {
+                    if let Ok(_) = self.failover(&name) {
+                        failed_over.push(name);
+                    }
+                }
+            }
+        }
+        failed_over
     }
 }
 

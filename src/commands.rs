@@ -4312,15 +4312,60 @@ fn cmd_debug(ctx: &CmdCtx) -> RespValue {
 fn cmd_monitor(_ctx: &CmdCtx) -> RespValue { RespValue::ok() }
 
 fn cmd_module(ctx: &CmdCtx) -> RespValue {
+    use crate::modules::ModuleManager;
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    // 全局模块管理器（静态单例）
+    fn module_manager() -> &'static Mutex<ModuleManager> {
+        static MGR: OnceLock<Mutex<ModuleManager>> = OnceLock::new();
+        MGR.get_or_init(|| Mutex::new(ModuleManager::new()))
+    }
+
     let subcmd = ctx.arg_str(1).unwrap_or("").to_ascii_uppercase();
     match subcmd.as_str() {
-        "LIST" => RespValue::Array(vec![]),
-        "LOAD" => RespValue::ok(),
-        "UNLOAD" => RespValue::ok(),
+        "LIST" => {
+            let mgr = module_manager().lock().unwrap();
+            let modules = mgr.list_modules();
+            let mut result = Vec::new();
+            for (name, version, desc) in &modules {
+                let mut info = Vec::new();
+                info.push(RespValue::BulkString(b"name".to_vec()));
+                info.push(RespValue::BulkString(name.as_bytes().to_vec()));
+                info.push(RespValue::BulkString(b"version".to_vec()));
+                info.push(RespValue::BulkString(version.as_bytes().to_vec()));
+                info.push(RespValue::BulkString(b"desc".to_vec()));
+                info.push(RespValue::BulkString(desc.as_bytes().to_vec()));
+                result.push(RespValue::Array(info));
+            }
+            RespValue::Array(result)
+        }
+        "LOAD" => {
+            let path = ctx.arg_str(2).unwrap_or("");
+            if path.is_empty() {
+                return RespValue::err("ERR wrong number of arguments for 'MODULE|LOAD' command");
+            }
+            let mut mgr = module_manager().lock().unwrap();
+            match mgr.load_module(path) {
+                Ok(name) => RespValue::BulkString(name.into_bytes()),
+                Err(e) => RespValue::err(e),
+            }
+        }
+        "UNLOAD" => {
+            let name = ctx.arg_str(2).unwrap_or("");
+            if name.is_empty() {
+                return RespValue::err("ERR wrong number of arguments for 'MODULE|UNLOAD' command");
+            }
+            let mut mgr = module_manager().lock().unwrap();
+            match mgr.unload_module(name) {
+                Ok(()) => RespValue::ok(),
+                Err(e) => RespValue::err(e),
+            }
+        }
         "HELP" => RespValue::Array(vec![
-            RespValue::BulkString(b"LIST".to_vec()),
-            RespValue::BulkString(b"LOAD <path> [<arg> ...]".to_vec()),
-            RespValue::BulkString(b"UNLOAD <name>".to_vec()),
+            RespValue::BulkString(b"LIST - list loaded modules".to_vec()),
+            RespValue::BulkString(b"LOAD <path> - load a module from shared library".to_vec()),
+            RespValue::BulkString(b"UNLOAD <name> - unload a module by name".to_vec()),
         ]),
         _ => RespValue::err("ERR Unknown subcommand or wrong number of arguments for 'MODULE'"),
     }
