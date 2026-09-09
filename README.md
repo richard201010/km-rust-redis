@@ -103,6 +103,11 @@ LRANGE_100   131K rps     230K rps    176%    🚀 大幅超越
 
 ## 架构设计
 
+### 逻辑架构图
+
+![KM-Rust-Redis 架构图](architecture.svg)
+
+
 ### 对照 Redis C 源码
 
 ```
