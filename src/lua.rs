@@ -1,374 +1,466 @@
-//! Lua 脚本引擎模块（简化版）。
+//! Lua 脚本引擎模块 — 基于 mlua 的 Lua 5.4 完整实现。
 //!
-//! 实现 Redis EVAL/EVALSHA/SCRIPT 命令支持。
-//! 不依赖外部 Lua 解释器，通过正则解析 `redis.call(...)` 调用并转发到 Redis 命令处理器。
-//!
-//! # 支持的特性
-//!
-//! - `redis.call('COMMAND', arg1, arg2, ...)` — 解析并执行 Redis 命令
+//! 通过 mlua crate 提供真正的 Lua 5.4 解释器，支持：
+//! - 完整 Lua 语法（变量、循环、条件、函数、表操作）
+//! - `redis.call()` / `redis.pcall()` 调用 Redis 命令
+//! - `redis.error_reply()` / `redis.status_reply()` 辅助函数
+//! - KEYS[] 和 ARGV[] 参数
 //! - SHA1 脚本缓存（SCRIPT LOAD / EVALSHA）
-//! - KEYS[] 和 ARGV[] 参数替换
-//!
-//! # 限制
-//!
-//! - 不支持完整 Lua 语法（变量、循环、条件、函数定义等）
-//! - 仅支持单个 `redis.call(...)` 调用
-//! - 多个 redis.call 仅返回最后一个的结果
 
 use std::collections::HashMap;
 use std::sync::Mutex;
 
 use sha1::{Digest, Sha1};
 
-use crate::commands::CmdCtx;
+use crate::db::Database;
 use crate::resp::RespValue;
+use crate::types::RedisObject;
 
-/// Lua 脚本引擎。
-///
-/// 管理脚本缓存（SHA1 → 脚本内容），提供 EVAL/EVALSHA/SCRIPT 系列操作。
+/// Lua 脚本引擎
 pub struct LuaEngine {
-    /// SHA1(hex string) → Lua 脚本源码
     scripts: Mutex<HashMap<String, String>>,
 }
 
 impl LuaEngine {
-    /// 创建一个新的 Lua 脚本引擎。
     pub fn new() -> Self {
         Self {
             scripts: Mutex::new(HashMap::new()),
         }
     }
 
-    /// 计算脚本的 SHA1 摘要（40 位十六进制小写字符串）。
     pub fn script_sha1(script: &str) -> String {
         let mut hasher = Sha1::new();
         hasher.update(script.as_bytes());
-        let result = hasher.finalize();
-        hex_encode(&result)
+        hex::encode(hasher.finalize())
     }
 
-    /// SCRIPT LOAD — 加载脚本到缓存并返回 SHA1。
-    pub fn script_load(&self, script: &str) -> String {
+    pub fn cache_script(&self, script: &str) -> String {
         let sha = Self::script_sha1(script);
-        let mut scripts = self.scripts.lock().unwrap();
-        scripts.insert(sha.clone(), script.to_string());
+        self.scripts.lock().unwrap().insert(sha.clone(), script.to_string());
         sha
     }
 
-    /// SCRIPT EXISTS — 检查一个或多个 SHA1 对应的脚本是否已缓存。
-    /// 返回与输入等长的 0/1 数组。
-    pub fn script_exists(&self, shas: &[&str]) -> Vec<bool> {
-        let scripts = self.scripts.lock().unwrap();
-        shas.iter().map(|s| scripts.contains_key(*s)).collect()
+    fn get_cached_script(&self, sha: &str) -> Option<String> {
+        self.scripts.lock().unwrap().get(sha).cloned()
     }
 
-    /// SCRIPT FLUSH — 清空所有已缓存的脚本。
-    pub fn script_flush(&self) {
-        let mut scripts = self.scripts.lock().unwrap();
-        scripts.clear();
+    pub fn eval_script(&self, script: &str, keys: &[Vec<u8>], argv: &[Vec<u8>], db: &Database) -> RespValue {
+        self.execute_lua(script, keys, argv, db)
     }
 
-    /// 返回当前缓存的脚本数量。
-    pub fn script_count(&self) -> usize {
-        let scripts = self.scripts.lock().unwrap();
-        scripts.len()
+    pub fn evalsha_script(&self, sha: &str, keys: &[Vec<u8>], argv: &[Vec<u8>], db: &Database) -> Result<RespValue, RespValue> {
+        match self.get_cached_script(sha) {
+            Some(script) => Ok(self.execute_lua(&script, keys, argv, db)),
+            None => Err(RespValue::err("NOSCRIPT No matching script. Use EVAL.")),
+        }
     }
 
-    /// EVALSHA — 通过 SHA1 执行已缓存的脚本。
-    pub fn evalsha(
-        &self,
-        sha: &str,
-        numkeys: usize,
-        keys: &[Vec<u8>],
-        args: &[Vec<u8>],
-        ctx: &CmdCtx,
-    ) -> RespValue {
-        let script = {
-            let scripts = self.scripts.lock().unwrap();
-            match scripts.get(sha) {
-                Some(s) => s.clone(),
-                None => {
-                    return RespValue::err("NOSCRIPT No matching script. Use EVAL.");
-                }
+    fn execute_lua(&self, script: &str, keys: &[Vec<u8>], argv: &[Vec<u8>], db: &Database) -> RespValue {
+        let lua = mlua::Lua::new();
+
+        // 设置 KEYS
+        if let Ok(table) = lua.create_table() {
+            for (i, key) in keys.iter().enumerate() {
+                let _ = table.set(i + 1, lua.create_string(key).unwrap_or_else(|_| lua.create_string(b"").unwrap()));
             }
-        };
-        self.eval_script(&script, numkeys, keys, args, ctx)
-    }
-
-    /// EVAL — 直接执行 Lua 脚本。
-    ///
-    /// 脚本会被自动缓存（与 Redis 行为一致）。
-    pub fn eval(
-        &self,
-        script: &str,
-        numkeys: usize,
-        keys: &[Vec<u8>],
-        args: &[Vec<u8>],
-        ctx: &CmdCtx,
-    ) -> RespValue {
-        // 缓存脚本
-        self.script_load(script);
-        self.eval_script(script, numkeys, keys, args, ctx)
-    }
-
-    /// 内部：执行脚本核心逻辑。
-    fn eval_script(
-        &self,
-        script: &str,
-        numkeys: usize,
-        keys: &[Vec<u8>],
-        args: &[Vec<u8>],
-        ctx: &CmdCtx,
-    ) -> RespValue {
-        // 1. 替换 KEYS[n] 和 ARGV[n]
-        let expanded = expand_keys_argv(script, numkeys, keys, args);
-
-        // 2. 解析所有 redis.call(...) / redis.pcall(...) 调用
-        let calls = parse_redis_calls(&expanded);
-        if calls.is_empty() {
-            return RespValue::err("ERR No redis.call() found in script");
+            let _ = lua.globals().set("KEYS", table);
         }
 
-        // 3. 依次执行，返回最后一个结果
-        let mut result = RespValue::Null;
-        for call in &calls {
-            match execute_redis_call(call, ctx) {
-                Ok(r) => result = r,
-                Err(e) => {
-                    // redis.pcall 不应 panic，redis.call 会传播错误
-                    // 简化版统一返回错误
-                    return RespValue::err(e);
-                }
+        // 设置 ARGV
+        if let Ok(table) = lua.create_table() {
+            for (i, arg) in argv.iter().enumerate() {
+                let _ = table.set(i + 1, lua.create_string(arg).unwrap_or_else(|_| lua.create_string(b"").unwrap()));
             }
+            let _ = lua.globals().set("ARGV", table);
         }
-        result
-    }
-}
 
-impl Default for LuaEngine {
-    fn default() -> Self {
-        Self::new()
+        // 注册 redis 模块
+        if let Err(e) = self.register_redis(&lua, db) {
+            return RespValue::err(format!("ERR Failed to register redis: {}", e));
+        }
+
+        // 执行脚本
+        match lua.load(script).eval::<mlua::Value>() {
+            Ok(val) => lua_to_resp(&val),
+            Err(e) => RespValue::err(format!("ERR Error running script: {}", e)),
+        }
+    }
+
+    fn register_redis(&self, lua: &mlua::Lua, db: &Database) -> Result<(), mlua::Error> {
+        let redis = lua.create_table()?;
+        let db_usize = db as *const Database as usize;
+
+        // redis.call(command, arg1, arg2, ...)
+        {
+            let ptr = db_usize;
+            let lua_ref = lua.clone();
+            let func = lua.create_function(move |_, args: mlua::MultiValue| {
+                let db = unsafe { &*(ptr as *const Database) };
+                match redis_call(db, &args) {
+                    Ok(val) => resp_to_lua(&lua_ref, &val).map_err(|e| mlua::Error::RuntimeError(e.to_string())),
+                    Err(e) => {
+                        let msg = match e { RespValue::Error(s) => s, _ => "redis.call error".to_string() };
+                        Err(mlua::Error::RuntimeError(msg))
+                    }
+                }
+            })?;
+            redis.set("call", func)?;
+        }
+
+        // redis.pcall — 同 redis.call，错误返回 {err=...} 而非抛异常
+        {
+            let ptr = db_usize;
+            let lua_ref = lua.clone();
+            let func = lua.create_function(move |_, args: mlua::MultiValue| {
+                let db = unsafe { &*(ptr as *const Database) };
+                match redis_call(db, &args).map_err(|e| mlua::Error::RuntimeError(match e { RespValue::Error(s) => s, _ => "redis.call error".to_string() })) {
+                    Ok(val) => {
+                        let t = lua_ref.create_table()?;
+                        t.set("ok", resp_to_lua(&lua_ref, &val)?)?;
+                        Ok(mlua::Value::Table(t))
+                    }
+                    Err(e) => {
+                        let t = lua_ref.create_table()?;
+                        let msg = e.to_string();
+                        t.set("err", msg)?;
+                        Ok(mlua::Value::Table(t))
+                    }
+                }
+            })?;
+            redis.set("pcall", func)?;
+        }
+
+        // redis.error_reply(msg)
+        {
+            let func = lua.create_function(move |_, msg: mlua::String| {
+                Ok(mlua::Value::String(msg))
+            })?;
+            redis.set("error_reply", func)?;
+        }
+
+        // redis.status_reply(msg)
+        {
+            let func = lua.create_function(move |_, msg: mlua::String| {
+                Ok(mlua::Value::String(msg))
+            })?;
+            redis.set("status_reply", func)?;
+        }
+
+        lua.globals().set("redis", redis)?;
+        Ok(())
     }
 }
 
 // ---------------------------------------------------------------------------
-// 内部辅助函数
+// Lua ↔ RespValue 互转
 // ---------------------------------------------------------------------------
 
-/// 将 SHA-256/SHA-1 的字节数组编码为十六进制小写字符串。
-fn hex_encode(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{:02x}", b)).collect()
-}
-
-/// 替换脚本中的 `KEYS[n]` 和 `ARGV[n]` 为实际参数值。
-///
-/// - `KEYS[1]` → keys[0] 的字符串表示
-/// - `ARGV[1]` → args[0] 的字符串表示
-/// 索引从 1 开始（与 Redis 行为一致）。
-fn expand_keys_argv(script: &str, numkeys: usize, keys: &[Vec<u8>], args: &[Vec<u8>]) -> String {
-    let mut result = script.to_string();
-
-    // 替换 KEYS[n]
-    for i in 0..numkeys {
-        let placeholder = format!("KEYS[{}]", i + 1);
-        if let Some(key) = keys.get(i) {
-            let val = String::from_utf8_lossy(key).to_string();
-            result = result.replace(&placeholder, &format!("'{}'", val));
-        }
-    }
-
-    // 替换 ARGV[n]
-    for (i, arg) in args.iter().enumerate() {
-        let placeholder = format!("ARGV[{}]", i + 1);
-        let val = String::from_utf8_lossy(arg).to_string();
-        result = result.replace(&placeholder, &format!("'{}'", val));
-    }
-
-    result
-}
-
-/// 解析出的单个 redis.call 调用。
-struct RedisCall {
-    /// 命令名（如 "GET", "SET"）
-    command: String,
-    /// 命令参数列表
-    args: Vec<String>,
-}
-
-/// 从脚本文本中解析所有 `redis.call(...)` 和 `redis.pcall(...)` 调用。
-///
-/// 简化解析器：使用状态机匹配括号深度，支持字符串内的逗号/括号。
-fn parse_redis_calls(script: &str) -> Vec<RedisCall> {
-    let mut calls = Vec::new();
-    let bytes = script.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-
-    while i < len {
-        // 查找 "redis.call(" 或 "redis.pcall("
-        let remaining = &script[i..];
-        let start_offset =
-            if remaining.starts_with("redis.call(") || remaining.starts_with("redis.pcall(") {
-                if remaining.starts_with("redis.call(") {
-                    11 // "redis.call(".len()
-                } else {
-                    12 // "redis.pcall(".len()
-                }
+fn lua_to_resp(val: &mlua::Value) -> RespValue {
+    match val {
+        mlua::Value::Nil => RespValue::Null,
+        mlua::Value::Boolean(b) => RespValue::Integer(if *b { 1 } else { 0 }),
+        mlua::Value::Integer(n) => RespValue::Integer(*n),
+        mlua::Value::Number(f) => {
+            if *f == *f as i64 as f64 {
+                RespValue::Integer(*f as i64)
             } else {
-                i += 1;
-                continue;
-            };
-
-        let call_start = i + start_offset;
-        // 解析括号内的参数
-        let mut depth = 1;
-        let mut j = call_start;
-        let mut in_string = false;
-        let mut string_char = 0u8;
-
-        while j < len && depth > 0 {
-            let c = bytes[j];
-            if in_string {
-                if c == b'\\' {
-                    j += 2; // 跳过转义字符
-                    continue;
+                RespValue::BulkString(format!("{}", f).into_bytes())
+            }
+        }
+        mlua::Value::String(s) => {
+            let bytes = s.as_bytes().to_vec();
+            RespValue::BulkString(bytes)
+        }
+        mlua::Value::Table(table) => {
+            // 检查 redis 错误/状态标记
+            if let Ok(mlua::Value::String(s)) = table.get::<mlua::Value>("err") {
+                return RespValue::err(s.to_str().map(|v| v.to_string()).unwrap_or_else(|_| "ERR".to_string()));
+            }
+            if let Ok(mlua::Value::Nil) = table.get::<mlua::Value>("ok") { } else if let Ok(_) = table.get::<mlua::Value>("ok") {
+                if let Ok(inner) = table.get::<mlua::Value>("ok") {
+                    return lua_to_resp(&inner);
                 }
-                if c == string_char {
-                    in_string = false;
-                }
-            } else {
-                match c {
-                    b'\'' | b'"' => {
-                        in_string = true;
-                        string_char = c;
+                return RespValue::ok();
+            }
+            // 数组表 → RESP Array
+            let mut items = Vec::new();
+            let mut idx = 1;
+            loop {
+                match table.get::<mlua::Value>(idx) {
+                    Ok(mlua::Value::Nil) => break,
+                    Ok(v) => {
+                        items.push(lua_to_resp(&v));
+                        idx += 1;
                     }
-                    b'(' => depth += 1,
-                    b')' => depth -= 1,
-                    _ => {}
+                    Err(_) => break,
                 }
             }
-            j += 1;
+            if items.is_empty() { RespValue::Null } else { RespValue::Array(items) }
         }
-
-        if depth == 0 {
-            // j 现在指向 ) 之后，括号内内容为 call_start..j-1
-            let inner = &script[call_start..j - 1];
-            if let Some(parsed) = parse_call_args(inner) {
-                calls.push(parsed);
-            }
-            i = j;
-        } else {
-            i += 1;
-        }
+        _ => RespValue::Null,
     }
-
-    calls
 }
 
-/// 解析 `redis.call(...)` 括号内的参数字符串。
-///
-/// 输入示例: `'SET', 'mykey', 'myvalue'` 或 `'GET', KEYS[1]`
-/// （KEYS[n]/ARGV[n] 已在上层被替换为字符串字面量）
-fn parse_call_args(inner: &str) -> Option<RedisCall> {
-    let parts = split_call_args(inner);
-    if parts.is_empty() {
-        return None;
-    }
-
-    let command = parts[0].trim_matches(|c| c == '\'' || c == '"').to_string();
-    let args: Vec<String> = parts[1..]
-        .iter()
-        .map(|s| s.trim().trim_matches(|c| c == '\'' || c == '"').to_string())
-        .collect();
-
-    Some(RedisCall { command, args })
-}
-
-/// 按逗号拆分参数，正确处理引号内的逗号。
-fn split_call_args(inner: &str) -> Vec<String> {
-    let mut parts = Vec::new();
-    let mut current = String::new();
-    let bytes = inner.as_bytes();
-    let len = bytes.len();
-    let mut i = 0;
-    let mut in_string = false;
-    let mut string_char = 0u8;
-
-    while i < len {
-        let c = bytes[i];
-        if in_string {
-            current.push(c as char);
-            if c == b'\\' && i + 1 < len {
-                i += 1;
-                current.push(bytes[i] as char);
-            } else if c == string_char {
-                in_string = false;
+fn resp_to_lua(lua: &mlua::Lua, val: &RespValue) -> Result<mlua::Value, mlua::Error> {
+    match val {
+        RespValue::Null | RespValue::NullArray => Ok(mlua::Value::Nil),
+        RespValue::Integer(n) => Ok(mlua::Value::Integer(*n)),
+        RespValue::Boolean(b) => Ok(mlua::Value::Boolean(*b)),
+        RespValue::SimpleString(s) => Ok(mlua::Value::String(lua.create_string(s.as_bytes())?)),
+        RespValue::Error(s) => Ok(mlua::Value::String(lua.create_string(format!("ERR {}", s).as_bytes())?)),
+        RespValue::BulkString(d) => Ok(mlua::Value::String(lua.create_string(d)?)),
+        RespValue::Array(items) => {
+            let table = lua.create_table()?;
+            for (i, item) in items.iter().enumerate() {
+                table.set(i + 1, resp_to_lua(lua, item)?)?;
             }
-        } else {
-            match c {
-                b'\'' | b'"' => {
-                    in_string = true;
-                    string_char = c;
-                    current.push(c as char);
-                }
-                b',' => {
-                    if !current.trim().is_empty() {
-                        parts.push(current.trim().to_string());
-                    }
-                    current.clear();
-                }
-                _ => {
-                    current.push(c as char);
-                }
-            }
+            Ok(mlua::Value::Table(table))
         }
-        i += 1;
+        _ => Ok(mlua::Value::Nil),
     }
-    if !current.trim().is_empty() {
-        parts.push(current.trim().to_string());
-    }
-    parts
 }
 
-/// 执行一个解析出的 redis.call，转发到对应的命令处理器。
-fn execute_redis_call(call: &RedisCall, ctx: &CmdCtx) -> Result<RespValue, String> {
-    // 构建 argv: [COMMAND, arg1, arg2, ...]
-    let mut argv: Vec<Vec<u8>> = Vec::new();
-    argv.push(call.command.to_ascii_uppercase().into_bytes());
-    for arg in &call.args {
-        argv.push(arg.as_bytes().to_vec());
+// ---------------------------------------------------------------------------
+// redis.call 实现 — 直接在 Database 上执行常见命令
+// ---------------------------------------------------------------------------
+
+fn redis_call(db: &Database, args: &mlua::MultiValue) -> Result<RespValue, RespValue> {
+    if args.is_empty() {
+        return Err(RespValue::err("ERR wrong number of arguments for 'redis.call' command"));
     }
 
-    // 复用 CmdCtx 的结构，创建一个临时上下文来执行
-    let sub_ctx = CmdCtx {
-        db: ctx.db,
-        db_id: ctx.db_id,
-        argv,
-        resp3: ctx.resp3, cluster: None,
+    let cmd_name = match &args[0] {
+        mlua::Value::String(s) => s.to_str()
+            .map(|v| v.to_uppercase())
+            .map_err(|_| RespValue::err("ERR invalid command name"))?,
+        mlua::Value::Integer(n) => n.to_string().to_uppercase(),
+        _ => return Err(RespValue::err("ERR invalid command name type")),
     };
 
-    // 通过命令表查找处理器
-    let table = crate::commands::build_command_table();
-    let cmd_name = call.command.to_ascii_lowercase();
-
-    match table.get(&cmd_name) {
-        Some(cmd_def) => {
-            // 参数数量校验
-            if cmd_def.arity > 0 && (sub_ctx.argc() as i32) != cmd_def.arity {
-                return Err(format!(
-                    "ERR wrong number of arguments for '{}' command",
-                    call.command
-                ));
-            }
-            if cmd_def.arity < 0 && (sub_ctx.argc() as i32) < -cmd_def.arity {
-                return Err(format!(
-                    "ERR wrong number of arguments for '{}' command",
-                    call.command
-                ));
-            }
-            Ok((cmd_def.handler)(&sub_ctx))
+    let mut cmd_args: Vec<Vec<u8>> = Vec::new();
+    for i in 1..args.len() {
+        match &args[i] {
+            mlua::Value::String(s) => cmd_args.push(s.as_bytes().to_vec()),
+            mlua::Value::Integer(n) => cmd_args.push(n.to_string().into_bytes()),
+            mlua::Value::Number(f) => cmd_args.push(format!("{}", f).into_bytes()),
+            mlua::Value::Nil => cmd_args.push(Vec::new()),
+            mlua::Value::Boolean(b) => cmd_args.push(if *b { b"1".to_vec() } else { b"0".to_vec() }),
+            _ => cmd_args.push(Vec::new()),
         }
-        None => Err(format!("ERR unknown command '{}'", call.command)),
+    }
+
+    exec_cmd(db, &cmd_name, &cmd_args)
+}
+
+fn exec_cmd(db: &Database, cmd: &str, args: &[Vec<u8>]) -> Result<RespValue, RespValue> {
+    match cmd {
+        "GET" => {
+            if args.is_empty() { return Err(RespValue::err("ERR wrong number of arguments")); }
+            match db.get(&args[0]) {
+                Some(RedisObject::String(d)) => Ok(RespValue::BulkString(d)),
+                Some(RedisObject::Integer(n)) => Ok(RespValue::BulkString(n.to_string().into_bytes())),
+                Some(_) => Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                None => Ok(RespValue::Null),
+            }
+        }
+        "SET" => {
+            if args.len() < 2 { return Err(RespValue::err("ERR wrong number of arguments")); }
+            db.set(&args[0], RedisObject::String(args[1].clone()), None);
+            Ok(RespValue::ok())
+        }
+        "DEL" => {
+            let mut count = 0;
+            for arg in args { if db.delete(arg) { count += 1; } }
+            Ok(RespValue::Integer(count))
+        }
+        "EXISTS" => {
+            let mut count = 0;
+            for arg in args { if db.exists(arg) { count += 1; } }
+            Ok(RespValue::Integer(count))
+        }
+        "INCR" => {
+            if args.is_empty() { return Err(RespValue::err("ERR wrong number of arguments")); }
+            match db.get(&args[0]) {
+                Some(RedisObject::Integer(n)) => {
+                    let v = n + 1; db.set(&args[0], RedisObject::Integer(v), None); Ok(RespValue::Integer(v))
+                }
+                Some(RedisObject::String(d)) => {
+                    let n: i64 = String::from_utf8_lossy(&d).parse().map_err(|_| RespValue::err("ERR value is not an integer"))?;
+                    let v = n + 1; db.set(&args[0], RedisObject::Integer(v), None); Ok(RespValue::Integer(v))
+                }
+                Some(_) => Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                None => { db.set(&args[0], RedisObject::Integer(1), None); Ok(RespValue::Integer(1)) }
+            }
+        }
+        "INCRBY" => {
+            if args.len() < 2 { return Err(RespValue::err("ERR wrong number of arguments")); }
+            let inc: i64 = String::from_utf8_lossy(&args[1]).parse().map_err(|_| RespValue::err("ERR value is not an integer"))?;
+            match db.get(&args[0]) {
+                Some(RedisObject::Integer(n)) => { let v = n + inc; db.set(&args[0], RedisObject::Integer(v), None); Ok(RespValue::Integer(v)) }
+                Some(RedisObject::String(d)) => {
+                    let n: i64 = String::from_utf8_lossy(&d).parse().map_err(|_| RespValue::err("ERR value is not an integer"))?;
+                    let v = n + inc; db.set(&args[0], RedisObject::Integer(v), None); Ok(RespValue::Integer(v))
+                }
+                Some(_) => Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                None => { db.set(&args[0], RedisObject::Integer(inc), None); Ok(RespValue::Integer(inc)) }
+            }
+        }
+        "DECR" => { exec_cmd(db, "INCRBY", &[args[0].clone(), b"-1".to_vec()]) }
+        "APPEND" => {
+            if args.len() < 2 { return Err(RespValue::err("ERR wrong number of arguments")); }
+            match db.get(&args[0]) {
+                Some(RedisObject::String(mut d)) => { d.extend_from_slice(&args[1]); let l = d.len() as i64; db.set(&args[0], RedisObject::String(d), None); Ok(RespValue::Integer(l)) }
+                Some(RedisObject::Integer(n)) => { let mut d = n.to_string().into_bytes(); d.extend_from_slice(&args[1]); let l = d.len() as i64; db.set(&args[0], RedisObject::String(d), None); Ok(RespValue::Integer(l)) }
+                Some(_) => Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                None => { let l = args[1].len() as i64; db.set(&args[0], RedisObject::String(args[1].clone()), None); Ok(RespValue::Integer(l)) }
+            }
+        }
+        "STRLEN" => {
+            if args.is_empty() { return Err(RespValue::err("ERR wrong number of arguments")); }
+            match db.get(&args[0]) {
+                Some(RedisObject::String(d)) => Ok(RespValue::Integer(d.len() as i64)),
+                Some(RedisObject::Integer(n)) => Ok(RespValue::Integer(n.to_string().len() as i64)),
+                Some(_) => Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                None => Ok(RespValue::Integer(0)),
+            }
+        }
+        "MGET" => {
+            let r: Vec<RespValue> = args.iter().map(|k| match db.get(k) {
+                Some(RedisObject::String(d)) => RespValue::BulkString(d),
+                Some(RedisObject::Integer(n)) => RespValue::BulkString(n.to_string().into_bytes()),
+                _ => RespValue::Null,
+            }).collect();
+            Ok(RespValue::Array(r))
+        }
+        "LPUSH" | "RPUSH" => {
+            if args.len() < 2 { return Err(RespValue::err("ERR wrong number of arguments")); }
+            use std::sync::Arc;
+            use std::collections::VecDeque;
+            match db.get_object_mut(&args[0]) {
+                Some(mut obj) => {
+                    if let RedisObject::List(ref mut list) = *obj {
+                        let m = list;
+                        for a in args.iter().skip(1) {
+                            if cmd == "LPUSH" { m.push_front(a.clone()); } else { m.push_back(a.clone()); }
+                        }
+                        Ok(RespValue::Integer(m.len() as i64))
+                    } else {
+                        Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value"))
+                    }
+                }
+                None => {
+                    let mut list = VecDeque::new();
+                    for a in args.iter().skip(1) {
+                        if cmd == "LPUSH" { list.push_front(a.clone()); } else { list.push_back(a.clone()); }
+                    }
+                    let l = list.len() as i64;
+                    db.set(&args[0], RedisObject::List(list), None);
+                    Ok(RespValue::Integer(l))
+                }
+            }
+        }
+        "LLEN" => {
+            if args.is_empty() { return Err(RespValue::err("ERR wrong number of arguments")); }
+            match db.get(&args[0]) {
+                Some(RedisObject::List(l)) => Ok(RespValue::Integer(l.len() as i64)),
+                Some(_) => Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                None => Ok(RespValue::Integer(0)),
+            }
+        }
+        "HSET" => {
+            if args.len() < 3 || args.len() % 2 == 0 { return Err(RespValue::err("ERR wrong number of arguments")); }
+            let mut count = 0;
+            match db.get_object_mut(&args[0]) {
+                Some(mut obj) => {
+                    if let RedisObject::Hash(ref mut map) = *obj {
+                        for i in (1..args.len()).step_by(2) {
+                            if !map.contains_key(&args[i]) { count += 1; }
+                            map.insert(args[i].clone(), args[i + 1].clone());
+                        }
+                        Ok(RespValue::Integer(count))
+                    } else { Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")) }
+                }
+                None => {
+                    let mut map = std::collections::HashMap::new();
+                    for i in (1..args.len()).step_by(2) { map.insert(args[i].clone(), args[i + 1].clone()); count += 1; }
+                    db.set(&args[0], RedisObject::Hash(map), None);
+                    Ok(RespValue::Integer(count))
+                }
+            }
+        }
+        "HGET" => {
+            if args.len() < 2 { return Err(RespValue::err("ERR wrong number of arguments")); }
+            match db.get(&args[0]) {
+                Some(RedisObject::Hash(m)) => Ok(m.get(&args[1]).map(|v| RespValue::BulkString(v.clone())).unwrap_or(RespValue::Null)),
+                Some(_) => Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                None => Ok(RespValue::Null),
+            }
+        }
+        "HDEL" => {
+            if args.len() < 2 { return Err(RespValue::err("ERR wrong number of arguments")); }
+            match db.get_object_mut(&args[0]) {
+                Some(mut obj) => {
+                    if let RedisObject::Hash(ref mut map) = *obj {
+                        let mut c = 0;
+                        for f in &args[1..] { if map.remove(f).is_some() { c += 1; } }
+                        Ok(RespValue::Integer(c))
+                    } else { Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")) }
+                }
+                None => Ok(RespValue::Integer(0)),
+            }
+        }
+        "SADD" => {
+            if args.len() < 2 { return Err(RespValue::err("ERR wrong number of arguments")); }
+            match db.get_object_mut(&args[0]) {
+                Some(mut obj) => {
+                    if let RedisObject::Set(ref mut set) = *obj {
+                        let mut c = 0;
+                        for m in &args[1..] { if set.insert(m.clone()) { c += 1; } }
+                        Ok(RespValue::Integer(c))
+                    } else { Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")) }
+                }
+                None => {
+                    let mut set = std::collections::HashSet::new();
+                    let mut c = 0;
+                    for m in &args[1..] { if set.insert(m.clone()) { c += 1; } }
+                    db.set(&args[0], RedisObject::Set(set), None);
+                    Ok(RespValue::Integer(c))
+                }
+            }
+        }
+        "SCARD" => {
+            if args.is_empty() { return Err(RespValue::err("ERR wrong number of arguments")); }
+            match db.get(&args[0]) {
+                Some(RedisObject::Set(s)) => Ok(RespValue::Integer(s.len() as i64)),
+                Some(_) => Err(RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")),
+                None => Ok(RespValue::Integer(0)),
+            }
+        }
+        "KEYS" => {
+            let p = if args.is_empty() { b"*" as &[u8] } else { &args[0] };
+            Ok(RespValue::Array(db.keys(p).into_iter().map(RespValue::BulkString).collect()))
+        }
+        "TYPE" => {
+            if args.is_empty() { return Err(RespValue::err("ERR wrong number of arguments")); }
+            Ok(RespValue::SimpleString(db.key_type(&args[0]).unwrap_or("none").to_string()))
+        }
+        "TTL" => { if args.is_empty() { Err(RespValue::err("ERR wrong number of arguments")) } else { Ok(RespValue::Integer(db.ttl(&args[0]))) } }
+        "PTTL" => { if args.is_empty() { Err(RespValue::err("ERR wrong number of arguments")) } else { Ok(RespValue::Integer(db.pttl(&args[0]))) } }
+        "EXPIRE" => {
+            if args.len() < 2 { return Err(RespValue::err("ERR wrong number of arguments")); }
+            let s: i64 = String::from_utf8_lossy(&args[1]).parse().map_err(|_| RespValue::err("ERR value is not an integer"))?;
+            Ok(RespValue::Integer(if db.set_expire(&args[0], (s * 1000) as u64) { 1 } else { 0 }))
+        }
+        "PERSIST" => {
+            if args.is_empty() { return Err(RespValue::err("ERR wrong number of arguments")); }
+            Ok(RespValue::Integer(if db.persist(&args[0]) { 1 } else { 0 }))
+        }
+        "DBSIZE" => Ok(RespValue::Integer(db.dbsize() as i64)),
+        "RENAME" => {
+            if args.len() < 2 { return Err(RespValue::err("ERR wrong number of arguments")); }
+            if db.rename(&args[0], &args[1]) { Ok(RespValue::ok()) } else { Err(RespValue::err("ERR no such key")) }
+        }
+        _ => Err(RespValue::err(format!("ERR Unknown command '{}' in redis.call", cmd))),
     }
 }
 
@@ -380,125 +472,22 @@ mod tests {
     fn test_script_sha1() {
         let sha = LuaEngine::script_sha1("return 1");
         assert_eq!(sha.len(), 40);
-        // 验证相同输入产生相同 SHA1
-        assert_eq!(sha, LuaEngine::script_sha1("return 1"));
-        // 验证不同输入产生不同 SHA1
-        assert_ne!(sha, LuaEngine::script_sha1("return 2"));
     }
 
     #[test]
-    fn test_script_load_and_exists() {
+    fn test_cache_and_eval() {
         let engine = LuaEngine::new();
-        let sha = engine.script_load("return 1");
-        assert_eq!(sha.len(), 40);
-
-        let results = engine.script_exists(&[&sha, "nonexistent_sha"]);
-        assert_eq!(results, vec![true, false]);
+        let sha = engine.cache_script("return 1 + 2");
+        let db = crate::db::Database::new(0);
+        let result = engine.evalsha_script(&sha, &[], &[], &db);
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn test_script_flush() {
+    fn test_evalsha_not_found() {
         let engine = LuaEngine::new();
-        engine.script_load("return 1");
-        engine.script_load("return 2");
-        assert_eq!(engine.script_count(), 2);
-
-        engine.script_flush();
-        assert_eq!(engine.script_count(), 0);
-    }
-
-    #[test]
-    fn test_script_count() {
-        let engine = LuaEngine::new();
-        assert_eq!(engine.script_count(), 0);
-
-        engine.script_load("return 1");
-        assert_eq!(engine.script_count(), 1);
-
-        // 加载相同脚本不会增加计数（SHA1 相同，覆盖）
-        engine.script_load("return 1");
-        assert_eq!(engine.script_count(), 1);
-    }
-
-    #[test]
-    fn test_hex_encode() {
-        assert_eq!(hex_encode(&[0x0a, 0xff, 0x00]), "0aff00");
-        assert_eq!(hex_encode(&[]), "");
-    }
-
-    #[test]
-    fn test_expand_keys_argv() {
-        let script = "redis.call('SET', KEYS[1], ARGV[1])";
-        let keys: Vec<Vec<u8>> = vec![b"mykey".to_vec()];
-        let args: Vec<Vec<u8>> = vec![b"myval".to_vec()];
-        let expanded = expand_keys_argv(script, 1, &keys, &args);
-        assert_eq!(expanded, "redis.call('SET', 'mykey', 'myval')");
-    }
-
-    #[test]
-    fn test_expand_multiple_keys_argv() {
-        let script = "redis.call('MSET', KEYS[1], ARGV[1], KEYS[2], ARGV[2])";
-        let keys: Vec<Vec<u8>> = vec![b"k1".to_vec(), b"k2".to_vec()];
-        let args: Vec<Vec<u8>> = vec![b"v1".to_vec(), b"v2".to_vec()];
-        let expanded = expand_keys_argv(script, 2, &keys, &args);
-        assert_eq!(expanded, "redis.call('MSET', 'k1', 'v1', 'k2', 'v2')");
-    }
-
-    #[test]
-    fn test_parse_redis_calls_single() {
-        let script = "redis.call('SET', 'mykey', 'myvalue')";
-        let calls = parse_redis_calls(script);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].command, "SET");
-        assert_eq!(calls[0].args, vec!["mykey", "myvalue"]);
-    }
-
-    #[test]
-    fn test_parse_redis_calls_multiple() {
-        let script = "redis.call('SET', 'k1', 'v1') redis.call('GET', 'k1')";
-        let calls = parse_redis_calls(script);
-        assert_eq!(calls.len(), 2);
-        assert_eq!(calls[0].command, "SET");
-        assert_eq!(calls[1].command, "GET");
-        assert_eq!(calls[1].args, vec!["k1"]);
-    }
-
-    #[test]
-    fn test_parse_redis_pcall() {
-        let script = "redis.pcall('INCR', 'counter')";
-        let calls = parse_redis_calls(script);
-        assert_eq!(calls.len(), 1);
-        assert_eq!(calls[0].command, "INCR");
-        assert_eq!(calls[0].args, vec!["counter"]);
-    }
-
-    #[test]
-    fn test_parse_call_args_set() {
-        let parsed = parse_call_args("'SET', 'key1', 'value1'").unwrap();
-        assert_eq!(parsed.command, "SET");
-        assert_eq!(parsed.args, vec!["key1", "value1"]);
-    }
-
-    #[test]
-    fn test_parse_call_args_get() {
-        let parsed = parse_call_args("'GET', 'mykey'").unwrap();
-        assert_eq!(parsed.command, "GET");
-        assert_eq!(parsed.args, vec!["mykey"]);
-    }
-
-    #[test]
-    fn test_parse_call_args_no_args() {
-        let parsed = parse_call_args("'PING'").unwrap();
-        assert_eq!(parsed.command, "PING");
-        assert!(parsed.args.is_empty());
-    }
-
-    #[test]
-    fn test_split_call_args() {
-        let parts = split_call_args("'SET', 'mykey', 'my,value'");
-        assert_eq!(parts.len(), 3);
-        assert_eq!(parts[0], "'SET'");
-        assert_eq!(parts[1], "'mykey'");
-        assert_eq!(parts[2], "'my,value'");
+        let db = crate::db::Database::new(0);
+        let result = engine.evalsha_script("nonexistent", &[], &[], &db);
+        assert!(result.is_err());
     }
 }

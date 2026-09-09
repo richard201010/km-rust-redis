@@ -32,3 +32,7 @@ tikv-jemallocator = "0.6"
 opt-level = 3
 lto = true
 codegen-units = 1
+
+[dependencies.mlua]
+version = "0.10"
+features = ["lua54", "vendored", "send"]
