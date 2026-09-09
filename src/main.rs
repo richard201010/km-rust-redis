@@ -26,6 +26,7 @@ pub static MALLOC_CONF: &[u8] =
 // 模块声明：分别负责命令实现、数据库存储、RESP 协议解析、数据类型定义
 mod acl;
 mod aof;
+mod cluster;
 mod commands;
 mod db;
 mod pubsub;
@@ -129,6 +130,8 @@ struct ServerState {
     aof: Mutex<Option<aof::AofWriter>>,
     /// Pub/Sub 发布订阅管理器
     pubsub: Arc<pubsub::PubSub>,
+    /// Cluster 集群状态（Arc<Mutex<ClusterState>> 支持跨任务共享）
+    cluster: Arc<Mutex<cluster::ClusterState>>,
 }
 
 impl ServerState {
@@ -146,6 +149,9 @@ impl ServerState {
             shutdown: AtomicBool::new(false),
             aof: Mutex::new(None),
             pubsub: Arc::new(pubsub::PubSub::new()),
+            cluster: Arc::new(Mutex::new(cluster::ClusterState::new_single_node(
+                args.port,
+            ))),
         }
     }
 }
@@ -504,17 +510,18 @@ async fn execute_command(
 
     // 读命令用读锁（不互斥），写命令用写锁（独占）
     // 大部分命令是读操作，RwLock 可大幅提升并发性能
+    let cluster = Some(Arc::clone(&state.cluster));
     if cmd.flags & commands::CMD_WRITE != 0 {
         // 写命令：获取写锁
         let mut db_guard = state.db.write().await;
         let db_ref = db_guard.get_db(db_id);
-        let ctx = CmdCtx { db: db_ref, db_id, argv, resp3 };
+        let ctx = CmdCtx { db: db_ref, db_id, argv, resp3, cluster };
         (cmd.handler)(&ctx)
     } else {
         // 读命令：获取读锁（多个读命令可并行执行）
         let db_guard = state.db.read().await;
         let db_ref = db_guard.get_db(db_id);
-        let ctx = CmdCtx { db: db_ref, db_id, argv, resp3 };
+        let ctx = CmdCtx { db: db_ref, db_id, argv, resp3, cluster };
         (cmd.handler)(&ctx)
     }
 }

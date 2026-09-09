@@ -344,7 +344,7 @@ fn execute_redis_call(call: &RedisCall, ctx: &CmdCtx) -> Result<RespValue, Strin
         db: ctx.db,
         db_id: ctx.db_id,
         argv,
-        resp3: ctx.resp3,
+        resp3: ctx.resp3, cluster: None,
     };
 
     // 通过命令表查找处理器

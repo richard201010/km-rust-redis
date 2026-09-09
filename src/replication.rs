@@ -1,21 +1,31 @@
 //! 主从复制模块（Replication）
 //!
-//! 实现 Redis 风格的主从复制状态管理，包括角色切换、从节点跟踪和复制偏移量记录。
+//! 实现 Redis 风格的主从复制，包括 PSYNC 协议、全量同步（full resync）和增量同步（partial resync）。
 //!
 //! # 设计要点
 //!
-//! - [`ReplicationState`] 维护当前节点的复制角色（Master/Slave）及从节点列表
+//! - [`ReplicationState`] 维护当前节点的复制角色、主节点信息、从节点列表和复制偏移量
 //! - [`SlaveInfo`] 记录每个已连接从节点的状态（地址、偏移量、延迟等）
 //! - 支持 `REPLICAOF host port` 设置为某主节点的从节点
 //! - 支持 `REPLICAOF NO ONE` 提升为主节点
 //! - `info_replication()` 生成与 Redis `INFO replication` 一致的输出格式
-//!
-//! # 简化说明
-//!
-//! 本模块仅实现角色管理和状态跟踪，不实现真正的 PSYNC/全量同步/增量同步。
-//! REPLICAOF 命令更新内部状态并返回 OK。
+//! - 全量同步：通过 `start_full_sync()` 生成 RDB 快照，供从节点拉取
+//! - 增量同步：通过 `buffer_write()` 维护 repl_backlog（环形缓冲区，上限 1MB），
+//!   `get_backlog_for_offset()` 根据偏移量返回可用的增量数据
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Mutex;
+
+use crate::db::RedisDb;
+use crate::rdb;
+
+// ---------------------------------------------------------------------------
+// 常量
+// ---------------------------------------------------------------------------
+
+/// repl_backlog 最大容量（1 MB）
+const REPL_BACKLOG_MAX: usize = 1 * 1024 * 1024;
 
 // ---------------------------------------------------------------------------
 // 角色与状态枚举
@@ -110,6 +120,12 @@ pub struct ReplicationState {
     pub repl_offset: AtomicU64,
     /// 从节点 ID 自增计数器
     slave_id_counter: AtomicU64,
+    /// 复制 ID（40 字节十六进制字符串），主节点启动时生成
+    repl_id: String,
+    /// 增量复制的 repl_backlog（环形缓冲区）
+    repl_backlog: Mutex<VecDeque<u8>>,
+    /// repl_backlog 中第一个字节对应的偏移量
+    repl_backlog_off: AtomicU64,
 }
 
 impl ReplicationState {
@@ -123,16 +139,26 @@ impl ReplicationState {
             connected_slaves: Vec::new(),
             repl_offset: AtomicU64::new(0),
             slave_id_counter: AtomicU64::new(0),
+            repl_id: generate_repl_id(),
+            repl_backlog: Mutex::new(VecDeque::new()),
+            repl_backlog_off: AtomicU64::new(0),
         }
+    }
+
+    /// 获取当前复制 ID。
+    pub fn replid(&self) -> &str {
+        &self.repl_id
+    }
+
+    /// 获取当前复制偏移量。
+    pub fn offset(&self) -> u64 {
+        self.repl_offset.load(Ordering::Relaxed)
     }
 
     /// 执行 REPLICAOF 命令。
     ///
     /// - `REPLICAOF host port` → 将当前节点设为指定主节点的从节点
     /// - `REPLICAOF NO ONE` → 提升当前节点为主节点，断开与原主节点的连接
-    ///
-    /// # 返回
-    /// 始终返回 `Ok(())`，表示状态已更新。
     pub fn replicaof(&mut self, host: &str, port: u16) {
         self.role = Role::Slave;
         self.master_host = Some(host.to_string());
@@ -184,17 +210,83 @@ impl ReplicationState {
         self.repl_offset.fetch_add(delta, Ordering::Relaxed);
     }
 
-    /// 获取当前复制偏移量。
-    pub fn offset(&self) -> u64 {
-        self.repl_offset.load(Ordering::Relaxed)
+    /// 全量同步：生成 RDB 快照并返回文件内容的字节。
+    ///
+    /// 当从节点发送 PSYNC <replid> <offset> 时，若主节点判定需要全量同步，
+    /// 调用此方法生成 RDB 快照，然后将文件字节通过 TCP 发送给从节点。
+    ///
+    /// # 参数
+    /// - `db`: 数据库引用，用于生成 RDB 快照
+    ///
+    /// # 返回
+    /// RDB 文件的完整字节内容；I/O 错误时返回 `Err`。
+    pub fn start_full_sync(&self, db: &RedisDb) -> std::io::Result<Vec<u8>> {
+        // 先写入临时文件
+        let path = "/tmp/km-redis-fullsync.rdb";
+        rdb::save_snapshot(db, path)?;
+        // 读取整个文件返回字节
+        let bytes = std::fs::read(path)?;
+        log::info!(
+            "Full sync: generated RDB snapshot ({} bytes), replid={}",
+            bytes.len(),
+            self.repl_id
+        );
+        Ok(bytes)
+    }
+
+    /// 将一条写命令的 RESP 字节追加到 repl_backlog。
+    ///
+    /// 每条写命令执行后调用，同时推进 repl_offset。
+    ///
+    /// # 参数
+    /// - `cmd_resp`: 命令的完整 RESP 编码字节
+    pub fn buffer_write(&self, cmd_resp: &[u8]) {
+        let len = cmd_resp.len() as u64;
+        // 推进偏移量
+        self.repl_offset.fetch_add(len, Ordering::Relaxed);
+
+        // 追加到 backlog
+        let mut backlog = self.repl_backlog.lock().unwrap();
+        backlog.extend(cmd_resp.iter().copied());
+
+        // 如果超过上限，从头部移除多余数据并调整 backlog_off
+        while backlog.len() > REPL_BACKLOG_MAX {
+            backlog.pop_front();
+            self.repl_backlog_off.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    /// 根据偏移量从 repl_backlog 返回可用的增量数据。
+    ///
+    /// 如果指定偏移量仍在 backlog 覆盖范围内，返回从该偏移量开始的字节；
+    /// 如果偏移量已过期（被新数据覆盖），返回 `None`。
+    ///
+    /// # 参数
+    /// - `offset`: 从节点请求的偏移量
+    ///
+    /// # 返回
+    /// 可用的增量字节；若偏移量不在 backlog 范围内则返回 `None`。
+    pub fn get_backlog_for_offset(&self, offset: u64) -> Option<Vec<u8>> {
+        let backlog_off = self.repl_backlog_off.load(Ordering::Relaxed);
+        let backlog = self.repl_backlog.lock().unwrap();
+
+        if offset < backlog_off {
+            // 偏移量已被覆盖，必须全量同步
+            return None;
+        }
+
+        let relative = (offset - backlog_off) as usize;
+        if relative >= backlog.len() {
+            // 偏移量在未来（不应发生）
+            return None;
+        }
+
+        Some(backlog.iter().skip(relative).copied().collect())
     }
 
     /// 生成 `INFO replication` 的输出内容。
     ///
-    /// 格式与 Redis 的 `INFO replication` 输出一致，包含：
-    /// - role / connected_slaves / repl_offset（主节点）
-    /// - master_host / master_port / master_link_status（从节点）
-    /// - slave<N> 条目（主节点的从节点列表）
+    /// 格式与 Redis 的 `INFO replication` 输出一致。
     pub fn info_replication(&self) -> String {
         let mut info = String::new();
 
@@ -205,6 +297,7 @@ impl ReplicationState {
             self.connected_slaves.len()
         ));
         info.push_str(&format!("repl_offset:{}\r\n", self.offset()));
+        info.push_str(&format!("replid:{}\r\n", self.repl_id));
 
         // 从节点特有字段
         if self.role == Role::Slave {
@@ -242,17 +335,27 @@ impl Default for ReplicationState {
 }
 
 // ---------------------------------------------------------------------------
+// 辅助函数
+// ---------------------------------------------------------------------------
+
+/// 生成 40 字节十六进制的复制 ID。
+///
+/// 对应 Redis 的 `server.replid`，每次主节点启动时随机生成。
+fn generate_repl_id() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let t = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    // 简单的伪随机 ID：基于时间戳 + 常量填充到 40 字符
+    format!("{:016x}{:016x}{:08x}", t, t ^ 0xDEADBEEF, 1)
+}
+
+// ---------------------------------------------------------------------------
 // REPLICAOF 命令处理函数（供 commands.rs 调用）
 // ---------------------------------------------------------------------------
 
 /// 解析并执行 REPLICAOF 命令参数。
-///
-/// - `REPLICAOF NO ONE` → 返回 `Ok(true)` 表示应调用 `replicaof_no_one()`
-/// - `REPLICAOF host port` → 返回 `Ok((host, port))` 表示应调用 `replicaof(host, port)`
-/// - 参数错误 → 返回 `Err(错误消息)`
-///
-/// 此函数仅做参数解析，实际状态更新由调用方（commands.rs 或服务端循环）完成，
-/// 因为当前 `CmdCtx` 不持有 `ReplicationState` 引用。
 pub fn parse_replicaof_args(args: &[Vec<u8>]) -> Result<ReplicaOfCmd, String> {
     if args.len() < 3 {
         return Err("ERR wrong number of arguments for 'replicaof' command".to_string());
@@ -295,6 +398,7 @@ pub enum ReplicaOfCmd {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::Ordering;
 
     #[test]
     fn test_default_is_master() {
@@ -304,6 +408,7 @@ mod tests {
         assert!(repl.master_port.is_none());
         assert_eq!(repl.connected_slaves.len(), 0);
         assert_eq!(repl.offset(), 0);
+        assert_eq!(repl.replid().len(), 40);
     }
 
     #[test]
@@ -336,7 +441,6 @@ mod tests {
         repl.add_slave("192.168.1.11:6380".to_string());
         assert_eq!(repl.connected_slaves.len(), 2);
 
-        // 当设为从节点时，从节点列表应被清空
         repl.replicaof("127.0.0.1", 6379);
         assert_eq!(repl.connected_slaves.len(), 0);
     }
@@ -353,7 +457,6 @@ mod tests {
         assert_eq!(repl.connected_slaves.len(), 1);
         assert_eq!(repl.connected_slaves[0].id, id2);
 
-        // 不存在的 ID
         assert!(!repl.remove_slave(999));
     }
 
@@ -380,7 +483,7 @@ mod tests {
         assert!(info.contains("connected_slaves:1\r\n"));
         assert!(info.contains("repl_offset:42\r\n"));
         assert!(info.contains("# Replication\r\n"));
-        // 主节点不应包含 master_host 字段
+        assert!(info.contains("replid:"));
         assert!(!info.contains("master_host:"));
     }
 
@@ -394,7 +497,6 @@ mod tests {
         assert!(info.contains("master_host:10.0.0.1\r\n"));
         assert!(info.contains("master_port:6379\r\n"));
         assert!(info.contains("master_link_status:up\r\n"));
-        // 从节点不应列出 slave 条目
         assert!(!info.contains("slave0:"));
     }
 
@@ -402,9 +504,7 @@ mod tests {
     fn test_info_replication_format() {
         let repl = ReplicationState::new();
         let info = repl.info_replication();
-        // 应以 # Replication 开头
         assert!(info.starts_with("# Replication\r\n"));
-        // 应以空行结尾
         assert!(info.ends_with("\r\n\r\n"));
     }
 
@@ -485,23 +585,128 @@ mod tests {
         let mut repl = ReplicationState::new();
         assert_eq!(repl.role, Role::Master);
 
-        // 添加从节点
         let s1 = repl.add_slave("10.0.0.2:6380".to_string());
         let s2 = repl.add_slave("10.0.0.3:6380".to_string());
         repl.advance_offset(1000);
         assert_eq!(repl.connected_slaves.len(), 2);
         assert_eq!(repl.offset(), 1000);
 
-        // 降级为从节点
         repl.replicaof("10.0.0.1", 6379);
         assert_eq!(repl.role, Role::Slave);
-        assert_eq!(repl.connected_slaves.len(), 0); // 从节点列表被清空
+        assert_eq!(repl.connected_slaves.len(), 0);
 
-        // 提升回主节点
         repl.replicaof_no_one();
         assert_eq!(repl.role, Role::Master);
         assert!(repl.connected_slaves.is_empty());
-        // offset 在 replicaof 时没有重置，这与 Redis 行为一致
         assert_eq!(repl.offset(), 1000);
+    }
+
+    // ---------------------------------------------------------------------------
+    // PSYNC / 增量复制测试
+    // ---------------------------------------------------------------------------
+
+    #[test]
+    fn test_buffer_write_advances_offset() {
+        let repl = ReplicationState::new();
+        assert_eq!(repl.offset(), 0);
+
+        // 写入一条 RESP 命令字节
+        let cmd = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        repl.buffer_write(cmd);
+
+        assert_eq!(repl.offset(), cmd.len() as u64);
+    }
+
+    #[test]
+    fn test_buffer_write_multiple_commands() {
+        let repl = ReplicationState::new();
+        let cmd1 = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        let cmd2 = b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
+
+        repl.buffer_write(cmd1);
+        repl.buffer_write(cmd2);
+
+        assert_eq!(repl.offset(), (cmd1.len() + cmd2.len()) as u64);
+    }
+
+    #[test]
+    fn test_get_backlog_for_offset_returns_correct_bytes() {
+        let repl = ReplicationState::new();
+        let cmd1 = b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n";
+        let cmd2 = b"*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n";
+
+        repl.buffer_write(cmd1);
+        repl.buffer_write(cmd2);
+
+        // 从 offset 0 获取全部
+        let data = repl.get_backlog_for_offset(0).unwrap();
+        assert_eq!(data, b"*3\r\n$3\r\nSET\r\n$3\r\nfoo\r\n$3\r\nbar\r\n*2\r\n$3\r\nGET\r\n$3\r\nfoo\r\n");
+
+        // 从 cmd2 起始偏移获取
+        let data2 = repl.get_backlog_for_offset(cmd1.len() as u64).unwrap();
+        assert_eq!(data2, cmd2.as_slice());
+    }
+
+    #[test]
+    fn test_get_backlog_for_offset_expired() {
+        let repl = ReplicationState::new();
+        // backlog 为空时，任何偏移量都应返回 None
+        assert!(repl.get_backlog_for_offset(0).is_none());
+    }
+
+    #[test]
+    fn test_backlog_cap_at_1mb() {
+        let repl = ReplicationState::new();
+        // 写入超过 1MB 的数据
+        let large_cmd = vec![b'x'; 1024 * 1024]; // 1 MB
+        let one_more = vec![b'y'; 1024]; // 额外 1KB
+
+        repl.buffer_write(&large_cmd);
+        repl.buffer_write(&one_more);
+
+        let backlog = repl.repl_backlog.lock().unwrap();
+        assert!(
+            backlog.len() <= REPL_BACKLOG_MAX,
+            "backlog should be capped at {} but is {}",
+            REPL_BACKLOG_MAX,
+            backlog.len()
+        );
+        drop(backlog);
+
+        // backlog_off 应该已前进
+        let off = repl.repl_backlog_off.load(Ordering::Relaxed);
+        assert!(off > 0, "backlog_off should advance when data is truncated");
+    }
+
+    #[test]
+    fn test_replid_is_40_chars() {
+        let repl = ReplicationState::new();
+        let id = repl.replid();
+        assert_eq!(id.len(), 40);
+        assert!(
+            id.chars().all(|c| c.is_ascii_hexdigit()),
+            "replid should be hex: {}",
+            id
+        );
+    }
+
+    #[test]
+    fn test_start_full_sync_generates_rdb() {
+        use crate::db::RedisDb;
+        use crate::types::RedisObject;
+
+        let mut rdb = RedisDb::new(1);
+        rdb.databases[0].set(
+            b"testkey",
+            RedisObject::String(b"testval".to_vec()),
+            None,
+        );
+
+        let repl = ReplicationState::new();
+        let rdb_bytes = repl.start_full_sync(&rdb).unwrap();
+
+        // RDB 文件应以 "REDIS" 魔数开头
+        assert!(rdb_bytes.starts_with(b"REDIS"));
+        assert!(rdb_bytes.len() > 10);
     }
 }

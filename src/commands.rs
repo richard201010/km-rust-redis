@@ -51,6 +51,7 @@ pub struct CmdCtx<'a> {
     pub db_id: u8,
     pub argv: Vec<Vec<u8>>,
     pub resp3: bool,
+    pub cluster: Option<std::sync::Arc<tokio::sync::Mutex<crate::cluster::ClusterState>>>,
 }
 
 impl<'a> CmdCtx<'a> {
@@ -3799,7 +3800,7 @@ fn crc16(data: &[u8]) -> u16 {
 fn cmd_acl(ctx: &CmdCtx) -> RespValue {
     use crate::acl;
     let subcmd = ctx.arg_str(1).unwrap_or("").to_ascii_uppercase();
-    let state = acl::AclState::new();
+    let mut state = acl::AclState::new();
     match subcmd.as_str() {
         "LIST" => {
             let mut result = Vec::new();
@@ -3823,6 +3824,20 @@ fn cmd_acl(ctx: &CmdCtx) -> RespValue {
         "DELUSER" => RespValue::ok(),
         "LOG" => RespValue::Array(vec![]),
         "INFO" => RespValue::BulkString(state.info_acl().into_bytes()),
+        "SAVE" => {
+            let path = ctx.arg_str(2).unwrap_or("users.acl");
+            match state.save_to_file(path) {
+                Ok(()) => RespValue::ok(),
+                Err(e) => RespValue::err(e),
+            }
+        }
+        "LOAD" => {
+            let path = ctx.arg_str(2).unwrap_or("users.acl");
+            match state.load_from_file(path) {
+                Ok(n) => RespValue::ok(),
+                Err(e) => RespValue::err(e),
+            }
+        }
         _ => RespValue::err("ERR Unknown ACL subcommand"),
     }
 }
@@ -5014,12 +5029,12 @@ fn cmd_zmpop(ctx: &CmdCtx) -> RespValue {
     let count = if ctx.argc() > 3 + numkeys { ctx.arg_i64(3 + numkeys).unwrap_or(1) } else { 1 };
     for i in 2..2 + numkeys {
         if min_max == "MIN" {
-            let r = cmd_zpopmin(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3 });
+            let r = cmd_zpopmin(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3, cluster: None });
             if !matches!(r, RespValue::Array(ref v) if v.is_empty()) {
                 return RespValue::Array(vec![RespValue::BulkString(ctx.argv[i].clone()), r]);
             }
         } else {
-            let r = cmd_zpopmax(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3 });
+            let r = cmd_zpopmax(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3, cluster: None });
             if !matches!(r, RespValue::Array(ref v) if v.is_empty()) {
                 return RespValue::Array(vec![RespValue::BulkString(ctx.argv[i].clone()), r]);
             }
