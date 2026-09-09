@@ -1,0 +1,7 @@
+target/
+.DS_Store
+dump.rdb
+appendonly.aof
+*.rdb
+*.aof
+redis-8.10/

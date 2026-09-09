@@ -1,0 +1,23 @@
+[package]
+name = "km-rust-redis"
+version = "0.1.0"
+edition = "2021"
+description = "Redis 8 reimplementation in Rust"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+dashmap = "6"
+bytes = "1"
+rand = "0.8"
+chrono = "0.4"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
