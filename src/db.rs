@@ -183,7 +183,7 @@ impl Database {
         if pttl < 0 {
             pttl // -1 或 -2 原样返回
         } else {
-            (pttl + 999) / 1000 // 向上取整：哪怕只剩 1ms 也算 1 秒
+            (pttl.saturating_add(999)) / 1000 // 向上取整：哪怕只剩 1ms 也算 1 秒
         }
     }
 
@@ -397,6 +397,28 @@ impl Database {
             return None;
         }
         self.data.get_mut(key)
+    }
+
+    /// 获取键对应的值的**借用视图**（不克隆），带惰性过期检查。
+    ///
+    /// 与 [`Database::get`] 的区别：`get` 会把整个值 `clone()` 一份，
+    /// 对大列表/大集合来说是 O(N) 的拷贝（LRANGE 0 99 在 5 万元素列表上
+    /// 会退化成 0.9ms 级别）。本方法返回 DashMap 的只读守卫，调用方直接
+    /// 借用内部数据，复杂度只与请求范围有关。
+    ///
+    /// # 注意
+    /// 守卫存活期间该分片被读锁占用，调用方**不得**再对同一把 key 调用
+    /// 写方法（`set`/`delete`/`get_object_mut`），否则会自锁；读完即释放。
+    ///
+    /// # 返回
+    /// - `Some(Ref)`: 键存在且未过期，通过 `.value()` 借用 `RedisObject`
+    /// - `None`: 键不存在或已过期（过期键会被顺带删除）
+    pub fn get_ref(&self, key: &[u8]) -> Option<dashmap::mapref::one::Ref<'_, Vec<u8>, RedisObject>> {
+        if self.is_expired(key) {
+            self.delete(key);
+            return None;
+        }
+        self.data.get(key)
     }
 
     /// 主动过期：抽样检查并删除已过期的键。

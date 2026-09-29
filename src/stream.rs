@@ -363,6 +363,10 @@ pub struct Stream {
     max_deleted_entry_id: StreamId,
 }
 
+/// Redis 单个 listpack 节点默认最多容纳的条目数（`stream-node-max-entries`），
+/// 近似裁剪按这个边界整节点丢弃。
+const NODE_MAX_ENTRIES: usize = 100;
+
 impl Stream {
     /// 创建一个空的消息流。
     pub fn new() -> Self {
@@ -583,7 +587,7 @@ impl Stream {
     ///
     /// # 参数
     /// - `max_len`: 最大保留的消息数量
-    /// - `approximate`: 是否允许近似裁剪（Redis 的 `~` 语法，允许保留略多于 max_len）
+    /// - `approximate`: 是否使用近似裁剪（Redis 的 `~` 语法）
     ///
     /// # 返回
     /// 实际删除的消息数量
@@ -593,13 +597,7 @@ impl Stream {
         }
 
         let to_remove = if approximate {
-            // 近似裁剪：允许保留到最近的 listpack 边界
-            // 简化实现：允许额外保留 10% 的条目
-            let threshold = max_len + max_len / 10;
-            if self.length <= threshold {
-                return 0;
-            }
-            self.length - max_len
+            self.approximate_trim_len(max_len)
         } else {
             self.length - max_len
         };
@@ -615,6 +613,43 @@ impl Stream {
             }
         }
         self.length -= removed;
+        removed
+    }
+
+    /// 近似裁剪要删除的条数。
+    ///
+    /// Redis 的 `~` 只按整节点（默认 listpack 容量 100 条）从头部丢弃，且从不丢弃最后一个节点，
+    /// 因此它删除的条目只会比精确裁剪更少；`MAXLEN ~ 0` 例外，会清空整个流。
+    fn approximate_trim_len(&self, max_len: usize) -> usize {
+        if max_len == 0 {
+            return self.length;
+        }
+        let mut removed = 0;
+        while self.length - removed >= NODE_MAX_ENTRIES
+            && self.length - removed - NODE_MAX_ENTRIES >= max_len
+        {
+            removed += NODE_MAX_ENTRIES;
+        }
+        removed
+    }
+
+    /// 删除 ID 严格小于 `min` 的消息，对应 `XTRIM key MINID <id>` 的裁剪策略。
+    ///
+    /// # 返回
+    /// 实际删除的消息数量
+    pub fn trim_before(&mut self, min: StreamId) -> usize {
+        let mut removed = 0;
+        while let Some(id) = self.entries.front().map(|entry| entry.id) {
+            if id >= min {
+                break;
+            }
+            if id > self.max_deleted_entry_id {
+                self.max_deleted_entry_id = id;
+            }
+            self.entries.pop_front();
+            self.length -= 1;
+            removed += 1;
+        }
         removed
     }
 
@@ -915,6 +950,44 @@ impl Stream {
     /// 获取最后一条消息的 ID。
     pub fn last_id(&self) -> StreamId {
         self.last_id
+    }
+
+    /// 按 ID 升序的消息列表，供 RDB 持久化遍历。
+    pub fn entries(&self) -> &VecDeque<StreamEntry> {
+        &self.entries
+    }
+
+    /// 已添加的条目总数（含已删除），供 RDB 持久化。
+    pub fn entries_added(&self) -> u64 {
+        self.entries_added
+    }
+
+    /// 已删除条目的最大 ID，供 RDB 持久化。
+    pub fn max_deleted_entry_id(&self) -> StreamId {
+        self.max_deleted_entry_id
+    }
+
+    /// 消费者组集合，供 RDB 持久化。
+    pub fn groups(&self) -> &HashMap<String, ConsumerGroup> {
+        &self.consumer_groups
+    }
+
+    /// 从 RDB 快照重建流，保持消息、ID 序列与消费者组原样。
+    pub fn restore(
+        entries: VecDeque<StreamEntry>,
+        last_id: StreamId,
+        entries_added: u64,
+        max_deleted_entry_id: StreamId,
+        groups: HashMap<String, ConsumerGroup>,
+    ) -> Self {
+        Self {
+            length: entries.len(),
+            entries,
+            last_id,
+            entries_added,
+            max_deleted_entry_id,
+            consumer_groups: groups,
+        }
     }
 }
 

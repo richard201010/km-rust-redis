@@ -143,6 +143,8 @@ struct ServerState {
     cluster: Arc<Mutex<cluster::ClusterState>>,
     /// TLS 配置（None 表示未启用 TLS）
     tls_config: Option<Arc<rustls::ServerConfig>>,
+    /// Lua 脚本引擎（EVAL / EVALSHA / SCRIPT 缓存，全局共享一份脚本缓存）
+    lua: Arc<lua::LuaEngine>,
 }
 
 impl ServerState {
@@ -164,6 +166,7 @@ impl ServerState {
                 args.port,
             ))),
             tls_config: None,
+            lua: Arc::new(lua::LuaEngine::new()),
         }
     }
 }
@@ -259,8 +262,15 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
         // 将读到的原始字节追加到 RESP 解析器的内部缓冲区
         parser.extend(&read_buf[..n]);
 
-        // 循环解析缓冲区中所有已完整的 RESP 命令（可能一条 read 包含多条命令）
-        while let Ok(Some(val)) = parser.parse() {
+        // 循环解析缓冲区中所有已完整的 RESP 命令（可能一条 read 包含多条命令）。
+        // 解析错误不再被 `while let Ok(..)` 静默吞掉，而是记日志后停止本轮解析。
+        while let Some(val) = match parser.parse() {
+            Ok(v) => v,
+            Err(e) => {
+                log::warn!("Client {} RESP parse error: {}", client_id, e);
+                None
+            }
+        } {
             // 将 RespValue::Array 转换为 argv（字节数组列表）
             // Redis 协议中命令总是以数组形式传输
             let argv = match val {
@@ -304,21 +314,31 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
             }
 
             // ------- SELECT 切换数据库 -------
-            // 选择指定编号的逻辑数据库（0 到 databases-1）
+            // 选择指定编号的逻辑数据库（0 到 databases-1）。
+            // 三种失败路径都必须回包，否则客户端会一直等待响应（连接挂死）：
+            //   1. 缺参数/多参数 → wrong number of arguments
+            //   2. 参数不是 u64（如 "foo"、"-1"、"999999999999"）→ invalid DB index
+            //   3. 索引超出数据库数量 → DB index is out of range
             if cmd_eq(cmd_bytes, b"select") {
-                if let Some(db_str) = argv.get(1) {
-                    if let Ok(new_db) = String::from_utf8_lossy(db_str).parse::<u8>() {
-                        let db = state.db.write().await;
-                        if (new_db as usize) < db.databases.len() {
-                            db_id = new_db;
-                            let reply = RespValue::ok();
-                            reply.encode_fast_into(&mut write_buf);
-                        } else {
-                            let reply = RespValue::err(format!("ERR invalid DB index {}", new_db));
-                            reply.encode_fast_into(&mut write_buf);
+                let reply = if argv.len() != 2 {
+                    RespValue::err("ERR wrong number of arguments for 'select' command")
+                } else {
+                    let text = String::from_utf8_lossy(&argv[1]);
+                    match text.trim().parse::<u64>() {
+                        Ok(idx) => {
+                            // 只读锁足够：切换的是每个连接自己的 db_id，不改全局状态
+                            let db = state.db.read().await;
+                            if (idx as usize) < db.databases.len() {
+                                db_id = idx as u8;
+                                RespValue::ok()
+                            } else {
+                                RespValue::err("ERR DB index is out of range")
+                            }
                         }
+                        Err(_) => RespValue::err("ERR invalid DB index"),
                     }
-                }
+                };
+                reply.encode_fast_into(&mut write_buf);
                 continue;
             }
 
@@ -412,20 +432,19 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                 continue;
             }
 
-            // ------- PING 心跳检测（Pub/Sub 兼容格式）-------
-            // 普通模式返回 SimpleString("PONG")，这里按 Pub/Sub 规范返回数组格式
-            // [b"pong", b"参数"]，与 Redis 订阅模式下的 PING 行为一致
-            if cmd_eq(cmd_bytes, b"ping") {
+            // ------- PING 应答格式 -------
+            // 普通模式：交给命令表里的 cmd_ping，返回 +PONG（带参数时返回 BulkString）。
+            // 仅在 Pub/Sub 订阅模式下才按 redis-cli 期望的数组格式应答：
+            //   PING          → ["pong"]
+            //   PING payload  → ["pong", "payload"]
+            if cmd_eq(cmd_bytes, b"ping") && subscribed {
                 let reply = if argv.len() > 1 {
                     RespValue::Array(vec![
                         RespValue::BulkString(b"pong".to_vec()),
                         RespValue::BulkString(argv[1].clone()),
                     ])
                 } else {
-                    RespValue::Array(vec![
-                        RespValue::BulkString(b"pong".to_vec()),
-                        RespValue::BulkString(b"".to_vec()),
-                    ])
+                    RespValue::Array(vec![RespValue::BulkString(b"pong".to_vec())])
                 };
                 reply.encode_fast_into(&mut write_buf);
                 continue;
@@ -474,6 +493,29 @@ async fn handle_client(stream: TcpStream, state: Arc<ServerState>, client_id: u6
                         }
                     }
                 }
+            }
+
+            // ------- 订阅态维护（决定 PING 的应答格式）-------
+            // SUBSCRIBE 后进入订阅模式；UNSUBSCRIBE 取消了全部频道后退出订阅模式。
+            if cmd_eq(cmd_bytes, b"subscribe") {
+                subscribed = true;
+                for ch in argv.iter().skip(1) {
+                    let name = String::from_utf8_lossy(ch).into_owned();
+                    if !sub_channels.contains(&name) {
+                        sub_channels.push(name);
+                    }
+                }
+            } else if cmd_eq(cmd_bytes, b"unsubscribe") {
+                if argv.len() == 1 {
+                    // 不带参数 = 退订全部频道
+                    sub_channels.clear();
+                } else {
+                    for ch in argv.iter().skip(1) {
+                        let name = String::from_utf8_lossy(ch);
+                        sub_channels.retain(|c| c.as_str() != name);
+                    }
+                }
+                subscribed = !sub_channels.is_empty();
             }
 
             result.encode_fast_into(&mut write_buf);
@@ -528,15 +570,17 @@ async fn execute_command(
     // - arity == 0：不做校验（本实现中未使用）
     let argc = argv.len() as i32;
     let expected = cmd.arity;
+    // Redis 的报错始终用命令的小写规范名。
+    let cmd_name = cmd.name.to_ascii_lowercase();
     if expected > 0 && argc != expected {
         return RespValue::err(format!(
             "ERR wrong number of arguments for '{}' command",
-            String::from_utf8_lossy(&cmd_bytes)
+            cmd_name
         ));
     } else if expected < 0 && argc < -expected {
         return RespValue::err(format!(
             "ERR wrong number of arguments for '{}' command",
-            String::from_utf8_lossy(&cmd_bytes)
+            cmd_name
         ));
     }
 
@@ -554,6 +598,7 @@ async fn execute_command(
             total_commands: state.total_commands.load(std::sync::atomic::Ordering::Relaxed),
             connected_clients: 1,
             pubsub_channels: None,
+            lua: Some(Arc::clone(&state.lua)),
         };
         (cmd.handler)(&ctx)
     } else {
@@ -566,6 +611,7 @@ async fn execute_command(
             total_commands: state.total_commands.load(std::sync::atomic::Ordering::Relaxed),
             connected_clients: 1,
             pubsub_channels: None,
+            lua: Some(Arc::clone(&state.lua)),
         };
         (cmd.handler)(&ctx)
     }

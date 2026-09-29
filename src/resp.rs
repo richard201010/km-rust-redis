@@ -131,7 +131,21 @@ impl RespValue {
     ///
     /// `msg` 支持任何可转为 String 的类型，如 &str、String 等。
     pub fn err(msg: impl Into<String>) -> Self {
-        RespValue::Error(msg.into())
+        let msg = msg.into();
+        // RESP 的简单错误是**单行**：消息里一旦混入 CR/LF，客户端按 CRLF 切行就会错位，
+        // 表现为 `Error: Bad simple string value`（Lua 脚本错误、多行 traceback 最容易踩到）。
+        // 这里统一把换行压成空格，保证错误响应永远是一行。
+        if msg.contains('\r') || msg.contains('\n') {
+            let flat: String = msg
+                .chars()
+                .map(|c| match c {
+                    '\r' | '\n' => ' ',
+                    other => other,
+                })
+                .collect();
+            return RespValue::Error(flat);
+        }
+        RespValue::Error(msg)
     }
 
     /// 创建整数响应
@@ -677,6 +691,13 @@ impl RespParser {
     /// 注意：如果子元素数据不完整，当前实现会返回错误，
     /// 因为无法安全地将已消费的字节放回缓冲区。
     fn parse_array(&mut self) -> Result<Option<RespValue>, String> {
+        // 先**非破坏性**地确认整个数组都在缓冲区里，再消费字节。
+        // 否则一个跨 TCP 分片的大数组（如 5000 个参数的 RPUSH）会在解析到一半时
+        // 返回 Err("Incomplete array")，此时数量行已被 advance 掉，
+        // 上层 `while let Ok(Some(..))` 直接退出循环 —— 命令被静默丢弃、客户端永远等不到回包。
+        if scan_value(&self.buf, 0)?.is_none() {
+            return Ok(None);
+        }
         if let Some(pos) = find_crlf(&self.buf, 1) {
             let len_str =
                 std::str::from_utf8(&self.buf[1..pos]).map_err(|_| "Invalid array length")?;
@@ -796,6 +817,68 @@ fn find_crlf(buf: &[u8], start: usize) -> Option<usize> {
 /// SIMD 加速的 LF 搜索
 fn find_lf(buf: &[u8], start: usize) -> Option<usize> {
     memchr(b'\n', &buf[start..]).map(|offset| start + offset)
+}
+
+/// 非破坏性地扫描一个 RESP2 值占用的字节数（**不消费缓冲区**）。
+///
+/// 用于在真正解析前确认数据是否已经完整，避免"解析一半才发现数据不全"
+/// 导致已消费字节无法回退的问题。
+///
+/// # 返回
+/// - `Ok(Some(n))` — 从 `start` 起的 n 个字节是一个完整值
+/// - `Ok(None)` — 数据不足，等待更多字节后重试
+/// - `Err(msg)` — 格式非法（未知类型字节 / Bulk 长度与结尾不符）
+fn scan_value(buf: &[u8], start: usize) -> Result<Option<usize>, String> {
+    if start >= buf.len() {
+        return Ok(None);
+    }
+    // 当前值的头部行（`+xx` / `-xx` / `:123` / `$5` / `*2`）
+    let pos = match find_crlf(buf, start) {
+        Some(p) => p,
+        None => return Ok(None),
+    };
+    let after_line = pos + 2;
+    match buf[start] {
+        b'+' | b'-' | b':' => Ok(Some(after_line)),
+        b'$' => {
+            let len = parse_header_int(&buf[start + 1..pos])?;
+            if len < 0 {
+                // $-1 = Null
+                return Ok(Some(after_line));
+            }
+            let data_end = after_line + len as usize;
+            if buf.len() < data_end + 2 {
+                return Ok(None);
+            }
+            if buf[data_end] != b'\r' || buf[data_end + 1] != b'\n' {
+                return Err("Invalid bulk string terminator".to_string());
+            }
+            Ok(Some(data_end + 2))
+        }
+        b'*' => {
+            let count = parse_header_int(&buf[start + 1..pos])?;
+            if count < 0 {
+                // *-1 = NullArray
+                return Ok(Some(after_line));
+            }
+            let mut off = after_line;
+            for _ in 0..count as usize {
+                match scan_value(buf, off)? {
+                    Some(n) => off = n,
+                    None => return Ok(None),
+                }
+            }
+            Ok(Some(off))
+        }
+        other => Err(format!("Unexpected type byte: {}", other)),
+    }
+}
+
+/// 解析 RESP 头部行里的十进制整数（数组长度 / Bulk 长度）。
+fn parse_header_int(bytes: &[u8]) -> Result<i64, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "Invalid length encoding".to_string())?;
+    text.parse::<i64>()
+        .map_err(|_| format!("Invalid integer: {}", text))
 }
 
 #[cfg(test)]
@@ -922,5 +1005,54 @@ mod tests {
         parser.extend(&encoded);
         let decoded = parser.parse().unwrap().unwrap();
         assert_eq!(val, decoded);
+    }
+
+    /// 跨 TCP 分片的大数组必须等数据齐了再解析，而不是解析一半就报错丢命令。
+    ///
+    /// 回归背景：5000 个参数的 RPUSH 若被拆成两次 read，
+    /// 旧实现会返回 `Err("Incomplete array")` 并已消费数量行，
+    /// 上层把命令整个丢掉，客户端永远等不到回包。
+    #[test]
+    fn test_parse_array_split_across_reads() {
+        let mut items = vec![RespValue::BulkString(b"RPUSH".to_vec()), RespValue::BulkString(b"k".to_vec())];
+        for i in 0..5000 {
+            items.push(RespValue::BulkString(format!("v{}", i).into_bytes()));
+        }
+        let encoded = RespValue::Array(items.clone()).encode(false);
+
+        let mut parser = RespParser::new();
+        // 在第 700 字节处切断（会切在一个 bulk 中间）
+        parser.extend(&encoded[..700]);
+        let first = parser.parse();
+        assert!(
+            matches!(first, Ok(None)),
+            "数据不完整时应返回 Ok(None) 而不是 Err，实际: {:?}",
+            first.as_ref().map(|v| v.is_some()).map_err(|e| e.clone())
+        );
+
+        parser.extend(&encoded[700..]);
+        let decoded = parser.parse().unwrap().expect("数据齐后必须解析出命令");
+        assert_eq!(decoded, RespValue::Array(items));
+    }
+
+    /// 空数组、Null 数组在扫描时也要能正确判定完整性。
+    #[test]
+    fn test_scan_array_edge_cases() {
+        assert_eq!(scan_value(b"*0\r\n", 0), Ok(Some(4)));
+        assert_eq!(scan_value(b"*-1\r\n", 0), Ok(Some(5)));
+        assert_eq!(scan_value(b"*1\r\n$-1\r\n", 0), Ok(Some(9)));
+        assert_eq!(scan_value(b"*1\r\n$3\r\nab", 0), Ok(None)); // bulk 数据缺 1 字节 + CRLF
+        assert!(scan_value(b"*x\r\n", 0).is_err()); // 非法长度
+    }
+
+    /// RESP 错误响应必须是单行：混入换行会被压平，否则客户端按 CRLF 切行会错位。
+    #[test]
+    fn test_error_reply_is_single_line() {
+        let err = RespValue::err("ERR boom\nstack traceback:\n\t[C]: in ?");
+        let encoded = err.encode(false);
+        assert_eq!(encoded, b"-ERR boom stack traceback: \t[C]: in ?\r\n");
+
+        // 本身没有换行的消息保持原样
+        assert_eq!(RespValue::err("ERR plain").encode(false), b"-ERR plain\r\n");
     }
 }

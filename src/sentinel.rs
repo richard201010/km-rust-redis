@@ -918,8 +918,17 @@ mod tests {
         assert!(!status.is_odown);
         assert_eq!(status.num_slaves, 2);
         assert_eq!(status.num_other_sentinels, 3);
-        assert_eq!(status.time_since_last_pong, 0); // 刚初始化，差值为 0
-        assert_eq!(status.time_since_last_ok, 0);
+        // 毫秒时钟：monitor_master 到这里可能已经跨过 1ms，精确断言 ==0 会随机失败
+        assert!(
+            status.time_since_last_pong <= 50,
+            "got {}",
+            status.time_since_last_pong
+        );
+        assert!(
+            status.time_since_last_ok <= 50,
+            "got {}",
+            status.time_since_last_ok
+        );
     }
 
     #[test]

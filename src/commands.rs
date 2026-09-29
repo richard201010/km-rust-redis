@@ -59,6 +59,10 @@ pub struct CmdCtx<'a> {
     pub connected_clients: u64,
     /// Pub/Sub 频道管理（用于 SUBSCRIBE/UNSUBSCRIBE/PUBLISH）
     pub pubsub_channels: Option<std::sync::Arc<std::sync::Mutex<std::collections::HashSet<String>>>>,
+    /// Lua 脚本引擎（EVAL / EVALSHA / SCRIPT 共用同一份脚本缓存）。
+    /// 由服务端 `execute_command` 注入；单元测试里可传 `None`，
+    /// 此时 EVAL 类命令会返回明确的错误而不是静默吞掉。
+    pub lua: Option<std::sync::Arc<crate::lua::LuaEngine>>,
 }
 
 impl<'a> CmdCtx<'a> {
@@ -174,7 +178,8 @@ pub fn build_command_table() -> HashMap<String, CommandDef> {
     // 连接管理命令（Connection Commands）
     // 对应 Redis 的连接生命周期管理：连接探测、身份认证、数据库选择、断开连接等
     // ================================================================
-    cmd!("PING", cmd_ping, 1, 0);
+    // PING arity = -1：允许 `PING [message]`（Redis 的 pingCommand 就是 -1）
+    cmd!("PING", cmd_ping, -1, 0);
     cmd!("ECHO", cmd_echo, 2, 0);
     cmd!("SELECT", cmd_select, 2, 0);
     cmd!("AUTH", cmd_auth, -2, 0);
@@ -201,10 +206,10 @@ pub fn build_command_table() -> HashMap<String, CommandDef> {
     // 过期管理命令（Expiry Commands）
     // 设置/查询/移除键的过期时间，支持秒级和毫秒级精度
     // ================================================================
-    cmd!("EXPIRE", cmd_expire, 3, CMD_WRITE);
-    cmd!("EXPIREAT", cmd_expireat, 3, CMD_WRITE);
-    cmd!("PEXPIRE", cmd_pexpire, 3, CMD_WRITE);
-    cmd!("PEXPIREAT", cmd_pexpireat, 3, CMD_WRITE);
+    cmd!("EXPIRE", cmd_expire, -3, CMD_WRITE);
+    cmd!("EXPIREAT", cmd_expireat, -3, CMD_WRITE);
+    cmd!("PEXPIRE", cmd_pexpire, -3, CMD_WRITE);
+    cmd!("PEXPIREAT", cmd_pexpireat, -3, CMD_WRITE);
     cmd!("TTL", cmd_ttl, 2, CMD_READONLY);
     cmd!("PTTL", cmd_pttl, 2, CMD_READONLY);
     cmd!("PERSIST", cmd_persist, 2, CMD_WRITE);
@@ -432,8 +437,9 @@ pub fn build_command_table() -> HashMap<String, CommandDef> {
     // Lua 脚本命令（EVAL/EVALSHA/SCRIPT）
     // ================================================================
     cmd!("SCRIPT", cmd_script, -2, 0);
-    cmd!("EVAL", cmd_eval, -3, 0);
-    cmd!("EVALSHA", cmd_evalsha, -3, 0);
+    // EVAL 内部可能写库，按写命令处理：拿写锁 + 成功后把整条 EVAL 落 AOF
+    cmd!("EVAL", cmd_eval, -3, CMD_WRITE);
+    cmd!("EVALSHA", cmd_evalsha, -3, CMD_WRITE);
 
     // ================================================================
     // 地理空间命令（Geo Commands）
@@ -535,7 +541,7 @@ pub fn build_command_table() -> HashMap<String, CommandDef> {
     // Stream 命令（Stream Commands）— Redis 5.0+ 消息队列
     // ================================================================
     cmd!("XADD", cmd_xadd, -5, CMD_WRITE);
-    cmd!("XLEN", cmd_xlen, 3, CMD_READONLY);
+    cmd!("XLEN", cmd_xlen, 2, CMD_READONLY);
     cmd!("XRANGE", cmd_xrange, -4, CMD_READONLY);
     cmd!("XREVRANGE", cmd_xrevrange, -4, CMD_READONLY);
     cmd!("XREAD", cmd_xread, -3, CMD_READONLY);
@@ -797,56 +803,104 @@ fn cmd_renamenx(ctx: &CmdCtx) -> RespValue {
 // EXPIRE/EXPIREAT/PEXPIRE/PEXPIREAT/TTL/PTTL/PERSIST
 // ---------------------------------------------------------------------------
 
-fn cmd_expire(ctx: &CmdCtx) -> RespValue {
-    match ctx.arg_i64(1) {
-        Some(n) if n > 0 => {
-            if ctx.db.set_expire(&ctx.argv[1], (n as u64) * 1000) {
-                RespValue::Integer(1)
-            } else {
-                RespValue::Integer(0)
-            }
-        }
-        _ => RespValue::err("ERR invalid expire time"),
+/// 把 `EX`/`PX`/`EXAT`/`PXAT`/`SETEX` 一类的时间参数换算成绝对毫秒时刻。
+///
+/// 失败时返回 Redis 的原文错误回复；`name` 是小写命令名，只用于文案。
+fn deadline_from_arg(
+    ctx: &CmdCtx,
+    idx: usize,
+    unit_ms: i64,
+    absolute: bool,
+    name: &str,
+) -> Result<i64, RespValue> {
+    let invalid = || RespValue::err(format!("ERR invalid expire time in '{}' command", name));
+    let raw = ctx
+        .arg_i64(idx)
+        .ok_or_else(|| RespValue::err("ERR value is not an integer or out of range"))?;
+    let span = raw.checked_mul(unit_ms).ok_or_else(invalid)?;
+    if absolute {
+        Ok(span)
+    } else {
+        Ok(span.saturating_add(current_time_ms() as i64))
     }
+}
+
+/// `EXPIRE` 家族的条件选项。Redis 把它们当作四个独立的标志位，同一个选项重复出现是合法的。
+#[derive(Default, Clone, Copy)]
+struct ExpireFlags {
+    nx: bool,
+    xx: bool,
+    gt: bool,
+    lt: bool,
+}
+
+/// EXPIRE/PEXPIRE/EXPIREAT/PEXPIREAT 的公共实现，对应 Redis 的 `expireGenericCommand`。
+///
+/// # 参数
+/// - `name`：命令名（小写），只用于错误文案
+/// - `unit_ms`：时间参数换算到毫秒的乘数（秒级为 1000，毫秒级为 1）
+/// - `absolute`：时间参数是否已经是绝对 unix 时间戳
+fn expire_generic(ctx: &CmdCtx, name: &str, unit_ms: i64, absolute: bool) -> RespValue {
+    let mut flags = ExpireFlags::default();
+    for i in 3..ctx.argc() {
+        let tok = ctx.arg_str(i).unwrap_or("");
+        match tok.to_ascii_uppercase().as_str() {
+            "NX" => flags.nx = true,
+            "XX" => flags.xx = true,
+            "GT" => flags.gt = true,
+            "LT" => flags.lt = true,
+            _ => return RespValue::err(format!("ERR Unsupported option {}", tok)),
+        }
+    }
+    if flags.gt && flags.lt {
+        return RespValue::err("ERR GT and LT options at the same time are not compatible");
+    }
+    if (flags.nx && flags.xx) || ((flags.nx || flags.xx) && flags.gt) {
+        return RespValue::err("ERR NX and XX, GT or LT options at the same time are not compatible");
+    }
+
+    let now_ms = current_time_ms() as i64;
+    let current = ctx.db.expires.get(&ctx.argv[1]).map(|e| *e.value() as i64);
+    let when = match deadline_from_arg(ctx, 2, unit_ms, absolute, name) {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+
+    if !ctx.db.exists(&ctx.argv[1]) {
+        return RespValue::Integer(0);
+    }
+
+    // 没有 TTL 的键：GT 无满足条件的基准值，LT 则视当前为无穷大。
+    let satisfied = (!flags.nx || current.is_none())
+        && (!flags.xx || current.is_some())
+        && (!flags.gt || current.is_some_and(|c| when > c))
+        && (!flags.lt || !current.is_some_and(|c| when >= c));
+    if !satisfied {
+        return RespValue::Integer(0);
+    }
+
+    if when <= now_ms {
+        ctx.db.delete(&ctx.argv[1]);
+    } else {
+        ctx.db.set_expire_at(&ctx.argv[1], when as u64);
+    }
+    RespValue::Integer(1)
+}
+
+fn cmd_expire(ctx: &CmdCtx) -> RespValue {
+    expire_generic(ctx, "expire", 1000, false)
 }
 
 fn cmd_expireat(ctx: &CmdCtx) -> RespValue {
-    match ctx.arg_i64(1) {
-        Some(n) if n > 0 => {
-            if ctx.db.set_expire_at(&ctx.argv[1], (n as u64) * 1000) {
-                RespValue::Integer(1)
-            } else {
-                RespValue::Integer(0)
-            }
-        }
-        _ => RespValue::err("ERR invalid expire time"),
-    }
+    expire_generic(ctx, "expireat", 1000, true)
 }
 
 fn cmd_pexpire(ctx: &CmdCtx) -> RespValue {
-    match ctx.arg_i64(1) {
-        Some(n) if n > 0 => {
-            if ctx.db.set_expire(&ctx.argv[1], n as u64) {
-                RespValue::Integer(1)
-            } else {
-                RespValue::Integer(0)
-            }
-        }
-        _ => RespValue::err("ERR invalid expire time"),
-    }
+    expire_generic(ctx, "pexpire", 1, false)
 }
 
 fn cmd_pexpireat(ctx: &CmdCtx) -> RespValue {
-    match ctx.arg_i64(1) {
-        Some(n) if n > 0 => {
-            if ctx.db.set_expire_at(&ctx.argv[1], n as u64) {
-                RespValue::Integer(1)
-            } else {
-                RespValue::Integer(0)
-            }
-        }
-        _ => RespValue::err("ERR invalid expire time"),
-    }
+    expire_generic(ctx, "pexpireat", 1, true)
 }
 
 fn cmd_ttl(ctx: &CmdCtx) -> RespValue {
@@ -886,8 +940,9 @@ fn cmd_set(ctx: &CmdCtx) -> RespValue {
     let value = &ctx.argv[2];
     let mut nx = false;
     let mut xx = false;
-    let mut ex_ms: Option<u64> = None;
     let mut get = false;
+    let mut deadline: Option<i64> = None;
+    let mut absolute = false;
     let mut i = 3;
 
     while i < ctx.argc() {
@@ -905,64 +960,25 @@ fn cmd_set(ctx: &CmdCtx) -> RespValue {
                 get = true;
                 i += 1;
             }
-            "EX" => {
+            "EX" | "PX" | "EXAT" | "PXAT" => {
+                let secs_unit = matches!(opt.as_str(), "EX" | "EXAT");
+                absolute = matches!(opt.as_str(), "EXAT" | "PXAT");
                 i += 1;
-                if let Some(secs) = ctx.arg_i64(i) {
-                    if secs <= 0 {
-                        return RespValue::err("ERR invalid expire time in 'set' command");
-                    }
-                    ex_ms = Some(secs as u64 * 1000);
-                } else {
-                    return RespValue::err("ERR value is not an integer or out of range");
+                if i >= ctx.argc() {
+                    return RespValue::err("ERR syntax error");
+                }
+                match deadline_from_arg(ctx, i, if secs_unit { 1000 } else { 1 }, absolute, "set") {
+                    Ok(when) => deadline = Some(when),
+                    Err(e) => return e,
                 }
                 i += 1;
             }
-            "PX" => {
-                i += 1;
-                if let Some(ms) = ctx.arg_i64(i) {
-                    if ms <= 0 {
-                        return RespValue::err("ERR invalid expire time in 'set' command");
-                    }
-                    ex_ms = Some(ms as u64);
-                } else {
-                    return RespValue::err("ERR value is not an integer or out of range");
-                }
-                i += 1;
-            }
-            "EXAT" => {
-                i += 1;
-                if let Some(ts) = ctx.arg_i64(i) {
-                    let now_ms = current_time_ms();
-                    let abs = ts as u64 * 1000;
-                    if abs > now_ms {
-                        ex_ms = Some(abs - now_ms);
-                    } else {
-                        ex_ms = Some(0);
-                    }
-                } else {
-                    return RespValue::err("ERR value is not an integer or out of range");
-                }
-                i += 1;
-            }
-            "PXAT" => {
-                i += 1;
-                if let Some(ts) = ctx.arg_i64(i) {
-                    let now_ms = current_time_ms();
-                    let abs = ts as u64;
-                    if abs > now_ms {
-                        ex_ms = Some(abs - now_ms);
-                    } else {
-                        ex_ms = Some(0);
-                    }
-                } else {
-                    return RespValue::err("ERR value is not an integer or out of range");
-                }
-                i += 1;
-            }
-            _ => {
-                i += 1;
-            }
+            _ => return RespValue::err("ERR syntax error"),
         }
+    }
+
+    if nx && xx {
+        return RespValue::err("ERR syntax error");
     }
 
     let existed = ctx.db.exists(key);
@@ -973,6 +989,17 @@ fn cmd_set(ctx: &CmdCtx) -> RespValue {
     if xx && !existed {
         return RespValue::Null;
     }
+
+    let now_ms = current_time_ms() as i64;
+    if deadline.is_some_and(|when| when <= now_ms) {
+        if absolute {
+            // 绝对时刻已在过去：Redis 删除该键并回 OK，不写入新值。
+            ctx.db.delete(key);
+            return RespValue::ok();
+        }
+        return RespValue::err("ERR invalid expire time in 'set' command");
+    }
+    let ex_ms = deadline.map(|when| (when - now_ms) as u64);
 
     // Try to store as integer if possible
     let obj = match std::str::from_utf8(value) {
@@ -1001,31 +1028,35 @@ fn cmd_setnx(ctx: &CmdCtx) -> RespValue {
 }
 
 fn cmd_setex(ctx: &CmdCtx) -> RespValue {
-    match ctx.arg_i64(2) {
-        Some(secs) if secs > 0 => {
-            ctx.db.set(
-            &ctx.argv[1],
-                RedisObject::String(ctx.argv[3].clone()),
-                Some(secs as u64 * 1000),
-            );
-            RespValue::ok()
-        }
-        _ => RespValue::err("ERR invalid expire time"),
+    // 秒换算成毫秒可能溢出，Redis 与非法时间点同样报错。
+    let when = match deadline_from_arg(ctx, 2, 1000, false, "setex") {
+        Ok(w) => w,
+        Err(e) => return e,
+    };
+    if when <= current_time_ms() as i64 {
+        return RespValue::err("ERR invalid expire time in 'setex' command");
     }
+    ctx.db.set(
+        &ctx.argv[1],
+        RedisObject::String(ctx.argv[3].clone()),
+        None,
+    );
+    ctx.db.set_expire_at(&ctx.argv[1], when as u64);
+    RespValue::ok()
 }
 
 fn cmd_psetex(ctx: &CmdCtx) -> RespValue {
-    match ctx.arg_i64(2) {
-        Some(ms) if ms > 0 => {
-            ctx.db.set(
-            &ctx.argv[1],
-                RedisObject::String(ctx.argv[3].clone()),
-                Some(ms as u64),
-            );
-            RespValue::ok()
-        }
-        _ => RespValue::err("ERR invalid expire time"),
-    }
+    let ms = match ctx.arg_i64(2) {
+        Some(n) if n > 0 => n as u64,
+        Some(_) => return RespValue::err("ERR invalid expire time in 'psetex' command"),
+        None => return RespValue::err("ERR value is not an integer or out of range"),
+    };
+    ctx.db.set(
+        &ctx.argv[1],
+        RedisObject::String(ctx.argv[3].clone()),
+        Some(ms),
+    );
+    RespValue::ok()
 }
 
 fn cmd_mget(ctx: &CmdCtx) -> RespValue {
@@ -1580,10 +1611,15 @@ fn cmd_lrange(ctx: &CmdCtx) -> RespValue {
         Some(v) => v,
         None => return RespValue::err("ERR value is not an integer"),
     };
-    let list = match ctx.db.get(&ctx.argv[1]) {
-        Some(RedisObject::List(l)) => l,
-        Some(_) => return RespValue::err("WRONGTYPE"),
+    // 用借用视图而不是 clone：LRANGE 只需要 [start, stop] 这一小段，
+    // clone 整个列表会让 5 万元素列表上的 LRANGE 0 99 退化到 ~0.9ms（O(总长度)）。
+    let obj = match ctx.db.get_ref(&ctx.argv[1]) {
+        Some(obj) => obj,
         None => return RespValue::Array(vec![]),
+    };
+    let list = match obj.value() {
+        RedisObject::List(l) => l,
+        _ => return RespValue::err("WRONGTYPE"),
     };
     let len = list.len() as isize;
     let start = if start < 0 {
@@ -1604,9 +1640,12 @@ fn cmd_lrange(ctx: &CmdCtx) -> RespValue {
 }
 
 fn cmd_llen(ctx: &CmdCtx) -> RespValue {
-    match ctx.db.get(&ctx.argv[1]) {
-        Some(RedisObject::List(l)) => RespValue::Integer(l.len() as i64),
-        Some(_) => RespValue::err("WRONGTYPE"),
+    // 借用读取，避免为了取长度把整个列表 clone 一份（O(1) 而不是 O(N)）
+    match ctx.db.get_ref(&ctx.argv[1]) {
+        Some(obj) => match obj.value() {
+            RedisObject::List(l) => RespValue::Integer(l.len() as i64),
+            _ => RespValue::err("WRONGTYPE"),
+        },
         None => RespValue::Integer(0),
     }
 }
@@ -1616,8 +1655,12 @@ fn cmd_lindex(ctx: &CmdCtx) -> RespValue {
         Some(v) => v,
         None => return RespValue::err("ERR value is not an integer"),
     };
-    match ctx.db.get(&ctx.argv[1]) {
-        Some(RedisObject::List(l)) => {
+    let obj = match ctx.db.get_ref(&ctx.argv[1]) {
+        Some(obj) => obj,
+        None => return RespValue::Null,
+    };
+    match obj.value() {
+        RedisObject::List(l) => {
             let len = l.len() as isize;
             let actual = if idx < 0 { len + idx } else { idx };
             if actual < 0 || actual >= len {
@@ -1626,8 +1669,7 @@ fn cmd_lindex(ctx: &CmdCtx) -> RespValue {
                 RespValue::BulkString(l[actual as usize].clone())
             }
         }
-        Some(_) => RespValue::err("WRONGTYPE"),
-        None => RespValue::Null,
+        _ => RespValue::err("WRONGTYPE"),
     }
 }
 
@@ -1796,27 +1838,45 @@ fn cmd_rpushx(ctx: &CmdCtx) -> RespValue {
     cmd_rpush(ctx)
 }
 
+/// Redis 规范的 WRONGTYPE 回复。
+fn wrong_type() -> RespValue {
+    RespValue::err("WRONGTYPE Operation against a key holding the wrong kind of value")
+}
+
+/// 读取 `LMOVE`/`BLMOVE` 的方向参数，只接受 LEFT/RIGHT。
+fn list_where(ctx: &CmdCtx, idx: usize) -> Option<&'static str> {
+    let Some(dir) = ctx.arg_str(idx) else {
+        return None;
+    };
+    match dir.to_ascii_uppercase().as_str() {
+        "LEFT" => Some("LEFT"),
+        "RIGHT" => Some("RIGHT"),
+        _ => None,
+    }
+}
+
 fn cmd_rpoplpush(ctx: &CmdCtx) -> RespValue {
-    let val = match ctx.db.get(&ctx.argv[1]) {
-        Some(RedisObject::List(mut l)) => match l.pop_back() {
-            Some(v) => {
-                if l.is_empty() {
-                    ctx.db.delete(&ctx.argv[1]);
-                } else {
-                    ctx.db.set(&ctx.argv[1], RedisObject::List(l), None);
-                }
-                v
-            }
-            None => return RespValue::Null,
-        },
-        Some(_) => return RespValue::err("WRONGTYPE"),
+    // 与 Redis 一致：先校验两端类型，再修改源键，避免 WRONGTYPE 时已经弹出元素。
+    for key in [&ctx.argv[1], &ctx.argv[2]] {
+        if !matches!(ctx.db.get(key), None | Some(RedisObject::List(_))) {
+            return wrong_type();
+        }
+    }
+    let Some(RedisObject::List(mut l)) = ctx.db.get(&ctx.argv[1]) else {
+        return RespValue::Null;
+    };
+    let val = match l.pop_back() {
+        Some(v) => v,
         None => return RespValue::Null,
     };
-    // Push to destination
+    if l.is_empty() {
+        ctx.db.delete(&ctx.argv[1]);
+    } else {
+        ctx.db.set(&ctx.argv[1], RedisObject::List(l), None);
+    }
     let mut dest = match ctx.db.get(&ctx.argv[2]) {
         Some(RedisObject::List(l)) => l,
-        Some(_) => return RespValue::err("WRONGTYPE"),
-        None => VecDeque::new(),
+        _ => VecDeque::new(),
     };
     dest.push_front(val.clone());
     ctx.db
@@ -1824,35 +1884,38 @@ fn cmd_rpoplpush(ctx: &CmdCtx) -> RespValue {
     RespValue::BulkString(val)
 }
 
+/// `LMOVE src dst LEFT|RIGHT LEFT|RIGHT`
 fn cmd_lmove(ctx: &CmdCtx) -> RespValue {
-    let src_dir = ctx.arg_str(2).unwrap_or("").to_ascii_uppercase();
-    let dst_dir = ctx.arg_str(3).unwrap_or("").to_ascii_uppercase();
-    let val = match ctx.db.get(&ctx.argv[1]) {
-        Some(RedisObject::List(mut l)) => {
-            let v = if src_dir == "LEFT" {
-                l.pop_front()
-            } else {
-                l.pop_back()
-            };
-            match v {
-                Some(v) => {
-                    if l.is_empty() {
-                        ctx.db.delete(&ctx.argv[1]);
-                    } else {
-                        ctx.db.set(&ctx.argv[1], RedisObject::List(l), None);
-                    }
-                    v
-                }
-                None => return RespValue::Null,
-            }
-        }
-        Some(_) => return RespValue::err("WRONGTYPE"),
-        None => return RespValue::Null,
+    let Some(src_dir) = list_where(ctx, 3) else {
+        return RespValue::err("ERR syntax error");
     };
-    let mut dest = match ctx.db.get(&ctx.argv[4]) {
+    let Some(dst_dir) = list_where(ctx, 4) else {
+        return RespValue::err("ERR syntax error");
+    };
+    for key in [&ctx.argv[1], &ctx.argv[2]] {
+        if !matches!(ctx.db.get(key), None | Some(RedisObject::List(_))) {
+            return wrong_type();
+        }
+    }
+    let Some(RedisObject::List(mut l)) = ctx.db.get(&ctx.argv[1]) else {
+        return RespValue::Null;
+    };
+    let val = if src_dir == "LEFT" {
+        l.pop_front()
+    } else {
+        l.pop_back()
+    };
+    let Some(val) = val else {
+        return RespValue::Null;
+    };
+    if l.is_empty() {
+        ctx.db.delete(&ctx.argv[1]);
+    } else {
+        ctx.db.set(&ctx.argv[1], RedisObject::List(l), None);
+    }
+    let mut dest = match ctx.db.get(&ctx.argv[2]) {
         Some(RedisObject::List(l)) => l,
-        Some(_) => return RespValue::err("WRONGTYPE"),
-        None => VecDeque::new(),
+        _ => VecDeque::new(),
     };
     if dst_dir == "LEFT" {
         dest.push_front(val.clone());
@@ -1860,7 +1923,7 @@ fn cmd_lmove(ctx: &CmdCtx) -> RespValue {
         dest.push_back(val.clone());
     }
     ctx.db
-        .set(&ctx.argv[4], RedisObject::List(dest), None);
+        .set(&ctx.argv[2], RedisObject::List(dest), None);
     RespValue::BulkString(val)
 }
 
@@ -3348,47 +3411,23 @@ fn cmd_lmpop(ctx: &CmdCtx) -> RespValue {
     RespValue::Null
 }
 
-/// BLMOVE 命令：阻塞列表移动（简化版：不阻塞，立即执行）。
+/// BLMOVE 命令：阻塞列表移动（简化版：不阻塞，立即返回移动结果）。
 fn cmd_blmove(ctx: &CmdCtx) -> RespValue {
-    // 简化版：等同于 LMOVE，忽略 timeout
-    let src = &ctx.argv[1];
-    let dst = &ctx.argv[2];
-    let src_dir = ctx.arg_str(3).unwrap_or("").to_ascii_uppercase();
-    let dst_dir = ctx.arg_str(4).unwrap_or("").to_ascii_uppercase();
-    let val = match ctx.db.get_object_mut(src) {
-        Some(mut obj_ref) => match &mut *obj_ref {
-            RedisObject::List(ref mut l) => {
-                let v = if src_dir == "LEFT" { l.pop_front() } else { l.pop_back() };
-                match v {
-                    Some(val) => {
-                        let should_delete = l.is_empty();
-                        drop(obj_ref);
-                        if should_delete {
-                            ctx.db.delete(src);
-                        }
-                        val
-                    }
-                    None => return RespValue::Null,
-                }
-            }
-            _ => return RespValue::err("WRONGTYPE"),
-        },
-        None => return RespValue::Null,
+    let raw = ctx.arg_str(ctx.argv.len() - 1).unwrap_or_default();
+    let timeout = match raw.parse::<f64>() {
+        Ok(t) => t,
+        Err(_) => return RespValue::err("ERR timeout is not a float or out of range"),
     };
-    match ctx.db.get_object_mut(dst) {
-        Some(mut obj_ref) => match &mut *obj_ref {
-            RedisObject::List(ref mut l) => {
-                if dst_dir == "LEFT" { l.push_front(val.clone()); } else { l.push_back(val.clone()); }
-            }
-            _ => return RespValue::err("WRONGTYPE"),
-        },
-        None => {
-            let mut l = VecDeque::new();
-            if dst_dir == "LEFT" { l.push_front(val.clone()); } else { l.push_back(val.clone()); }
-            ctx.db.set(&dst, RedisObject::List(l), None);
-        }
+    if !timeout.is_finite() {
+        return RespValue::err("ERR timeout is out of range");
     }
-    RespValue::BulkString(val)
+    if timeout < 0.0 {
+        return RespValue::err("ERR timeout is negative");
+    }
+    if list_where(ctx, 3).is_none() || list_where(ctx, 4).is_none() {
+        return RespValue::err("ERR syntax error");
+    }
+    cmd_lmove(ctx)
 }
 
 /// HSCAN 命令：游标扫描哈希表字段。
@@ -4093,22 +4132,113 @@ fn cmd_acl(ctx: &CmdCtx) -> RespValue {
 // --- Script 命令 ---
 
 fn cmd_script(ctx: &CmdCtx) -> RespValue {
-    use crate::lua;
+    let engine = match &ctx.lua {
+        Some(engine) => engine,
+        None => return RespValue::err("ERR scripting engine is not available"),
+    };
     let subcmd = ctx.arg_str(1).unwrap_or("").to_ascii_uppercase();
     match subcmd.as_str() {
         "LOAD" => {
-            let script = ctx.arg_str(2).unwrap_or("");
-            use crate::lua::LuaEngine; let sha = LuaEngine::script_sha1(script);
+            let script = match ctx.arg_str(2) {
+                Some(s) => s,
+                None => return RespValue::err("ERR wrong number of arguments for 'script|load' command"),
+            };
+            // 真正写入脚本缓存，后续 EVALSHA 才能命中
+            let sha = engine.cache_script(script);
             RespValue::BulkString(sha.into_bytes())
         }
-        "EXISTS" => RespValue::Array(vec![RespValue::Integer(0)]),
-        "FLUSH" => RespValue::ok(),
+        "EXISTS" => {
+            // SCRIPT EXISTS sha1 [sha1 ...] — 每个 SHA 回 1/0
+            if ctx.argc() < 3 {
+                return RespValue::err("ERR wrong number of arguments for 'script|exists' command");
+            }
+            let mut result = Vec::with_capacity(ctx.argc() - 2);
+            for i in 2..ctx.argc() {
+                let sha = ctx.arg_str(i).unwrap_or("");
+                result.push(RespValue::Integer(if engine.has_script(sha) { 1 } else { 0 }));
+            }
+            RespValue::Array(result)
+        }
+        "FLUSH" => {
+            engine.flush_scripts();
+            RespValue::ok()
+        }
         _ => RespValue::err("ERR Unknown SCRIPT subcommand"),
     }
 }
 
-fn cmd_eval(_ctx: &CmdCtx) -> RespValue { RespValue::Null }
-fn cmd_evalsha(_ctx: &CmdCtx) -> RespValue { RespValue::Null }
+/// 解析 EVAL / EVALSHA 的公共参数。
+///
+/// 命令形态：`EVAL script numkeys [key ...] [arg ...]`，
+/// `numkeys` 位于 `numkeys_idx`（script/sha 之后一位）。
+///
+/// # 返回
+/// - `Ok((KEYS, ARGV))` — 成功拆分出的键列表与参数列表
+/// - `Err(RespValue)` — 参数非法（numkeys 不是整数 / numkeys 超过剩余参数个数）
+fn parse_eval_args(ctx: &CmdCtx, numkeys_idx: usize) -> Result<(Vec<Vec<u8>>, Vec<Vec<u8>>), RespValue> {
+    let numkeys_text = ctx
+        .arg_str(numkeys_idx)
+        .ok_or_else(|| RespValue::err("ERR wrong number of arguments"))?;
+    let numkeys: usize = numkeys_text
+        .parse()
+        .map_err(|_| RespValue::err("ERR value is not an integer or out of range"))?;
+
+    let rest = ctx.argc().saturating_sub(numkeys_idx + 1);
+    if numkeys > rest {
+        return Err(RespValue::err(
+            "ERR Number of keys can't be greater than number of args",
+        ));
+    }
+    let keys_start = numkeys_idx + 1;
+    let args_start = keys_start + numkeys;
+    let keys = ctx.argv[keys_start..args_start].to_vec();
+    let args = ctx.argv[args_start..].to_vec();
+    Ok((keys, args))
+}
+
+/// 执行 Lua 脚本的公共实现（EVAL / EVALSHA / EVAL_RO / EVALSHA_RO 共用）。
+///
+/// # 参数
+/// - `script_or_sha` — 脚本正文（`is_sha = false`）或脚本 SHA1（`is_sha = true`）
+fn eval_dispatch(ctx: &CmdCtx, script_or_sha: &str, is_sha: bool) -> RespValue {
+    let engine = match &ctx.lua {
+        Some(engine) => engine,
+        None => return RespValue::err("ERR scripting engine is not available"),
+    };
+    let (keys, args) = match parse_eval_args(ctx, 2) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+
+    if is_sha {
+        // EVALSHA：未命中缓存时按 NOSCRIPT 报错，与 Redis 一致
+        match engine.evalsha_script(script_or_sha, &keys, &args, ctx.db) {
+            Ok(reply) => reply,
+            Err(e) => e,
+        }
+    } else {
+        // EVAL：执行前先入缓存，让后续 EVALSHA 可以命中
+        engine.cache_script(script_or_sha);
+        engine.eval_script(script_or_sha, &keys, &args, ctx.db)
+    }
+}
+
+/// EVAL script numkeys [key ...] [arg ...] — 执行 Lua 脚本。
+/// 对应 Redis 的 `evalCommand`。
+fn cmd_eval(ctx: &CmdCtx) -> RespValue {
+    match ctx.arg_str(1) {
+        Some(script) => eval_dispatch(ctx, script, false),
+        None => RespValue::err("ERR wrong number of arguments for 'eval' command"),
+    }
+}
+
+/// EVALSHA sha1 numkeys [key ...] [arg ...] — 按 SHA1 执行已缓存脚本。
+fn cmd_evalsha(ctx: &CmdCtx) -> RespValue {
+    match ctx.arg_str(1) {
+        Some(sha) => eval_dispatch(ctx, sha, true),
+        None => RespValue::err("ERR wrong number of arguments for 'evalsha' command"),
+    }
+}
 
 // ===========================================================================
 // Hash 字段过期命令实现（Hash Field Expiry Commands）— Redis 8
@@ -4700,8 +4830,19 @@ fn cmd_arset(_ctx: &CmdCtx) -> RespValue { RespValue::err("ERR Array type not su
 // Script 高级命令实现
 // ===========================================================================
 
-fn cmd_eval_ro(_ctx: &CmdCtx) -> RespValue { RespValue::Null }
-fn cmd_evalsha_ro(_ctx: &CmdCtx) -> RespValue { RespValue::Null }
+fn cmd_eval_ro(ctx: &CmdCtx) -> RespValue {
+    match ctx.arg_str(1) {
+        Some(script) => eval_dispatch(ctx, script, false),
+        None => RespValue::err("ERR wrong number of arguments for 'eval|ro' command"),
+    }
+}
+
+fn cmd_evalsha_ro(ctx: &CmdCtx) -> RespValue {
+    match ctx.arg_str(1) {
+        Some(sha) => eval_dispatch(ctx, sha, true),
+        None => RespValue::err("ERR wrong number of arguments for 'evalsha|ro' command"),
+    }
+}
 fn cmd_fcall(_ctx: &CmdCtx) -> RespValue { RespValue::Null }
 fn cmd_fcall_ro(_ctx: &CmdCtx) -> RespValue { RespValue::Null }
 
@@ -4736,38 +4877,50 @@ fn cmd_migrate(_ctx: &CmdCtx) -> RespValue { RespValue::ok() }
 // Stream 命令实现 (调用 stream.rs)
 // ====================================================================
 fn cmd_xadd(ctx: &CmdCtx) -> RespValue {
-    use crate::stream::{Stream, StreamId};
+    use crate::stream::Stream;
     use std::collections::HashMap;
     let key = &ctx.argv[1];
-    let mut stream = match ctx.db.get(key) {
-        Some(RedisObject::Stream(s)) => s,
-        Some(_) => return RespValue::err("WRONGTYPE"),
-        None => Stream::new(),
+    let existing = match ctx.db.get(key) {
+        Some(RedisObject::Stream(s)) => Some(s),
+        Some(_) => return wrong_type(),
+        None => None,
     };
     let mut nomkstream = false;
-    let mut limit = None;
+    let mut trim: Option<(TrimBy, bool)> = None;
     let mut i = 2;
-    // 解析选项
     while i < ctx.argc() {
         let opt = ctx.arg_str(i).unwrap_or("").to_ascii_uppercase();
         match opt.as_str() {
-            "NOMKSTREAM" => { nomkstream = true; i += 1; }
-            "MAXLEN" | "MINID" => { i += 2; } // 跳过 ~ count
+            "NOMKSTREAM" => {
+                nomkstream = true;
+                i += 1;
+            }
+            "MAXLEN" | "MINID" => {
+                let (spec, approximate, next) = match parse_trim_spec(ctx, i) {
+                    Ok(parsed) => parsed,
+                    Err(e) => return e,
+                };
+                trim = Some((spec, approximate));
+                i = next;
+            }
             _ => break,
         }
     }
+    let mut stream = match existing {
+        Some(s) => s,
+        None if nomkstream => return RespValue::Null,
+        None => Stream::new(),
+    };
     // 解析 ID 或 *
     let id_str = ctx.arg_str(i).unwrap_or("*");
     let id = if id_str == "*" {
         None
     } else {
-        let parts: Vec<&str> = id_str.split('-').collect();
-        if parts.len() == 2 {
-            let ms: u64 = parts[0].parse().unwrap_or(0);
-            let seq: u64 = parts[1].parse().unwrap_or(0);
-            Some(StreamId::new(ms, seq))
-        } else {
-            return RespValue::err("ERR Invalid stream ID specified");
+        match parse_stream_id_arg(id_str) {
+            Some(id) => Some(id),
+            None => {
+                return RespValue::err("ERR Invalid stream ID specified as stream command argument")
+            }
         }
     };
     i += 1;
@@ -4777,13 +4930,76 @@ fn cmd_xadd(ctx: &CmdCtx) -> RespValue {
         fields.insert(ctx.argv[i].clone(), ctx.argv[i + 1].clone());
         i += 2;
     }
-    match stream.add(fields, id, limit, false) {
+    match stream.add(fields, id, None, false) {
         Ok(new_id) => {
-            ctx.db.set(&key, RedisObject::Stream(stream), None);
+            if let Some((spec, approximate)) = trim {
+                apply_trim(&mut stream, spec, approximate);
+            }
+            ctx.db.set(key, RedisObject::Stream(stream), None);
             RespValue::BulkString(format!("{}-{}", new_id.timestamp, new_id.sequence).into_bytes())
         }
         Err(e) => RespValue::err(e),
     }
+}
+
+/// `MAXLEN [=|~] n` / `MINID [=|~] id`：XADD 与 XTRIM 共用的裁剪参数。
+enum TrimBy {
+    MaxLen(usize),
+    MinId(crate::stream::StreamId),
+}
+
+/// 从 `argv[idx]` 起解析裁剪参数，返回（裁剪方式，是否近似，参数结束后的下标）。
+fn parse_trim_spec(ctx: &CmdCtx, idx: usize) -> Result<(TrimBy, bool, usize), RespValue> {
+    let keyword = ctx.arg_str(idx).unwrap_or_default().to_ascii_uppercase();
+    let max_len = match keyword.as_str() {
+        "MAXLEN" => true,
+        "MINID" => false,
+        _ => return Err(RespValue::err("ERR syntax error")),
+    };
+    let mut i = idx + 1;
+    let mut approximate = false;
+    match ctx.arg_str(i).as_deref() {
+        Some("~") => {
+            approximate = true;
+            i += 1;
+        }
+        Some("=") => i += 1,
+        _ => {}
+    }
+    let raw = ctx.arg_str(i).ok_or_else(|| {
+        RespValue::err("ERR value is not an integer or out of range")
+    })?;
+    let spec = if max_len {
+        let n: i64 = raw
+            .parse()
+            .map_err(|_| RespValue::err("ERR value is not an integer or out of range"))?;
+        if n < 0 {
+            return Err(RespValue::err("ERR The MAXLEN argument must be >= 0."));
+        }
+        TrimBy::MaxLen(n as usize)
+    } else {
+        let id = parse_stream_id_arg(&raw)
+            .ok_or_else(|| RespValue::err("ERR Invalid stream ID specified as stream command argument"))?;
+        TrimBy::MinId(id)
+    };
+    Ok((spec, approximate, i + 1))
+}
+
+/// 应用裁剪参数，返回被删除的消息数。近似（`~`）与精确在我们的存储结构下等价。
+fn apply_trim(stream: &mut crate::stream::Stream, spec: TrimBy, _approximate: bool) -> usize {
+    match spec {
+        TrimBy::MaxLen(n) => stream.trim(n, _approximate),
+        TrimBy::MinId(id) => stream.trim_before(id),
+    }
+}
+
+/// 解析命令参数中的流 ID：`ms`、`ms-seq` 合法，`-`/`+` 与无法解析的写法返回 None。
+fn parse_stream_id_arg(s: &str) -> Option<crate::stream::StreamId> {
+    let (ms, seq) = match s.split_once('-') {
+        Some((ms, seq)) => (ms.parse().ok()?, seq.parse().ok()?),
+        None => (s.parse().ok()?, 0),
+    };
+    Some(crate::stream::StreamId::new(ms, seq))
 }
 
 fn cmd_xlen(ctx: &CmdCtx) -> RespValue {
@@ -4851,16 +5067,22 @@ fn cmd_xdel(ctx: &CmdCtx) -> RespValue {
 }
 
 fn cmd_xtrim(ctx: &CmdCtx) -> RespValue {
-    match ctx.db.get_object_mut(&ctx.argv[1]) {
-        Some(mut obj_ref) => match &mut *obj_ref {
-            RedisObject::Stream(ref mut s) => {
-                let max_len: usize = ctx.arg_str(3).and_then(|s| s.parse().ok()).unwrap_or(0);
-                let approx = ctx.arg_str(2).map(|s| s == "~").unwrap_or(false);
-                let trimmed = s.trim(max_len, approx);
-                RespValue::Integer(trimmed as i64)
+    let (spec, approximate, next) = match parse_trim_spec(ctx, 2) {
+        Ok(parsed) => parsed,
+        Err(e) => return e,
+    };
+    if next != ctx.argc() {
+        return RespValue::err("ERR syntax error");
+    }
+    match ctx.db.get(&ctx.argv[1]) {
+        Some(RedisObject::Stream(mut s)) => {
+            let trimmed = apply_trim(&mut s, spec, approximate) as i64;
+            if trimmed > 0 {
+                ctx.db.set(&ctx.argv[1], RedisObject::Stream(s), None);
             }
-            _ => RespValue::err("WRONGTYPE"),
-        },
+            RespValue::Integer(trimmed)
+        }
+        Some(_) => wrong_type(),
         None => RespValue::Integer(0),
     }
 }
@@ -5168,7 +5390,82 @@ fn cmd_getdel(ctx: &CmdCtx) -> RespValue {
     }
 }
 
-fn cmd_getex(ctx: &CmdCtx) -> RespValue { cmd_get(ctx) }
+fn cmd_getex(ctx: &CmdCtx) -> RespValue {
+    #[derive(PartialEq, Clone, Copy)]
+    enum Opt {
+        Ex,
+        Px,
+        Exat,
+        Pxat,
+        Persist,
+    }
+
+    // 关键字先行解析：即使键不存在，语法错误也要照报，数值错误则不会。
+    let mut opt: Option<Opt> = None;
+    let mut raw_idx: Option<usize> = None;
+    let mut i = 2;
+    while i < ctx.argc() {
+        let tok = ctx.arg_str(i).unwrap_or("");
+        let kind = match tok.to_ascii_uppercase().as_str() {
+            "EX" => Opt::Ex,
+            "PX" => Opt::Px,
+            "EXAT" => Opt::Exat,
+            "PXAT" => Opt::Pxat,
+            "PERSIST" => Opt::Persist,
+            _ => return RespValue::err("ERR syntax error"),
+        };
+        if opt.is_some_and(|prev| prev != kind) {
+            return RespValue::err("ERR syntax error");
+        }
+        opt = Some(kind);
+        if kind != Opt::Persist {
+            i += 1;
+            if i >= ctx.argc() {
+                return RespValue::err("ERR syntax error");
+            }
+            raw_idx = Some(i);
+        }
+        i += 1;
+    }
+
+    let key = &ctx.argv[1];
+    let obj = match ctx.db.get(key) {
+        None => return RespValue::Null,
+        Some(o) => o,
+    };
+    let value = match &obj {
+        RedisObject::String(d) => RespValue::BulkString(d.clone()),
+        RedisObject::Integer(n) => RespValue::BulkString(n.to_string().into_bytes()),
+        _ => {
+            return RespValue::err(
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+            )
+        }
+    };
+
+    let Some(opt) = opt else {
+        // 不带选项：只读，TTL 原样保留。
+        return value;
+    };
+    if opt == Opt::Persist {
+        ctx.db.persist(key);
+        return value;
+    }
+
+    let now_ms = current_time_ms() as i64;
+    let secs_unit = matches!(opt, Opt::Ex | Opt::Exat);
+    let absolute = matches!(opt, Opt::Exat | Opt::Pxat);
+    let when = deadline_from_arg(ctx, raw_idx.unwrap(), if secs_unit { 1000 } else { 1 }, absolute, "getex");
+    match when {
+        // GETEX 与 EXPIRE 不同：已过期的时间点属于参数非法，键保持原样。
+        Ok(w) if w > now_ms => {
+            ctx.db.set_expire_at(key, w as u64);
+        }
+        Ok(_) => return RespValue::err("ERR invalid expire time in 'getex' command"),
+        Err(e) => return e,
+    }
+    value
+}
 
 fn cmd_expiretime(ctx: &CmdCtx) -> RespValue {
     if let Some(exp) = ctx.db.expires.get(&ctx.argv[1]) {
@@ -5328,16 +5625,489 @@ fn cmd_zmpop(ctx: &CmdCtx) -> RespValue {
     let count = if ctx.argc() > 3 + numkeys { ctx.arg_i64(3 + numkeys).unwrap_or(1) } else { 1 };
     for i in 2..2 + numkeys {
         if min_max == "MIN" {
-            let r = cmd_zpopmin(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3, cluster: None, server_start_time: 0, total_connections: 0, total_commands: 0, connected_clients: 0, pubsub_channels: None });
+            let r = cmd_zpopmin(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3, cluster: None, server_start_time: 0, total_connections: 0, total_commands: 0, connected_clients: 0, pubsub_channels: None, lua: ctx.lua.clone() });
             if !matches!(r, RespValue::Array(ref v) if v.is_empty()) {
                 return RespValue::Array(vec![RespValue::BulkString(ctx.argv[i].clone()), r]);
             }
         } else {
-            let r = cmd_zpopmax(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3, cluster: None, server_start_time: 0, total_connections: 0, total_commands: 0, connected_clients: 0, pubsub_channels: None });
+            let r = cmd_zpopmax(&CmdCtx { db: ctx.db, db_id: ctx.db_id, argv: vec![ctx.argv[i].clone(), count.to_string().into_bytes()], resp3: ctx.resp3, cluster: None, server_start_time: 0, total_connections: 0, total_commands: 0, connected_clients: 0, pubsub_channels: None, lua: ctx.lua.clone() });
             if !matches!(r, RespValue::Array(ref v) if v.is_empty()) {
                 return RespValue::Array(vec![RespValue::BulkString(ctx.argv[i].clone()), r]);
             }
         }
     }
     RespValue::Null
+}
+
+// ===========================================================================
+// 单元测试
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::Database;
+
+    /// 走真实命令表分派，并复用服务器的 arity 校验规则。
+    fn exec(db: &Database, table: &HashMap<String, CommandDef>, line: &str) -> RespValue {
+        let argv: Vec<Vec<u8>> = line.split_whitespace().map(|s| s.as_bytes().to_vec()).collect();
+        let cmd = &table[&String::from_utf8_lossy(&argv[0]).to_ascii_lowercase()];
+        let argc = argv.len() as i32;
+        if (cmd.arity > 0 && argc != cmd.arity) || (cmd.arity < 0 && argc < -cmd.arity) {
+            return RespValue::err("ERR wrong number of arguments");
+        }
+        let ctx = CmdCtx {
+            db,
+            db_id: 0,
+            argv,
+            resp3: false,
+            cluster: None,
+            server_start_time: 0,
+            total_connections: 0,
+            total_commands: 0,
+            connected_clients: 0,
+            pubsub_channels: None,
+            lua: None,
+        };
+        (cmd.handler)(&ctx)
+    }
+
+    fn db_with(key: &str, val: &str) -> Database {
+        let db = Database::new(0);
+        db.set(key.as_bytes(), RedisObject::String(val.as_bytes().to_vec()), None);
+        db
+    }
+
+    fn err_msg(v: RespValue) -> String {
+        match v {
+            RespValue::Error(s) => s,
+            other => panic!("expected error, got {other:?}"),
+        }
+    }
+
+    fn table() -> HashMap<String, CommandDef> {
+        build_command_table()
+    }
+
+    #[test]
+    fn test_expire_sets_ttl() {
+        let db = db_with("k", "v");
+        assert_eq!(exec(&db, &table(), "EXPIRE k 100"), RespValue::Integer(1));
+        let ttl = db.ttl(b"k");
+        assert!((99..=100).contains(&ttl), "ttl was {ttl}");
+    }
+
+    #[test]
+    fn test_pexpire_and_expireat_use_time_argument() {
+        let table = table();
+        let db = Database::new(0);
+        db.set(b"k", RedisObject::String(b"v".to_vec()), None);
+        db.set(b"k2", RedisObject::String(b"v".to_vec()), None);
+        assert_eq!(exec(&db, &table, "PEXPIRE k 60000"), RespValue::Integer(1));
+        assert_eq!(exec(&db, &table, "EXPIREAT k2 9999999999"), RespValue::Integer(1));
+        assert!(db.pttl(b"k") > 59_000);
+        assert!(db.ttl(b"k2") > 0);
+    }
+
+    #[test]
+    fn test_expire_missing_key_returns_zero() {
+        let db = Database::new(0);
+        assert_eq!(exec(&db, &table(), "EXPIRE nope 100"), RespValue::Integer(0));
+    }
+
+    #[test]
+    fn test_expire_non_integer_errors() {
+        let db = db_with("k", "v");
+        assert_eq!(
+            err_msg(exec(&db, &table(), "EXPIRE k abc")),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(db.ttl(b"k"), -1);
+    }
+
+    #[test]
+    fn test_expire_past_or_negative_deletes_key() {
+        let table = table();
+        for arg in ["0", "-5"] {
+            let db = db_with("k", "v");
+            assert_eq!(
+                exec(&db, &table, &format!("EXPIRE k {arg}")),
+                RespValue::Integer(1)
+            );
+            assert!(!db.exists(b"k"), "key should be gone for {arg}");
+        }
+    }
+
+    #[test]
+    fn test_expire_option_tokens() {
+        let table = table();
+        let db = db_with("k", "v");
+        // 同一选项重复出现是合法的，最后一次生效。
+        assert_eq!(exec(&db, &table, "EXPIRE k 100 NX NX"), RespValue::Integer(1));
+        assert!(db.ttl(b"k") > 0);
+        // 未知选项按 Redis 原文报错，并回显客户端给出的拼写。
+        assert_eq!(
+            err_msg(exec(&db, &table, "EXPIRE k 100 foo")),
+            "ERR Unsupported option foo"
+        );
+    }
+
+    #[test]
+    fn test_expire_incompatible_option_combinations() {
+        let table = table();
+        let nx_xx_msg = "ERR NX and XX, GT or LT options at the same time are not compatible";
+        for combo in ["NX XX", "NX GT", "XX GT", "NX XX GT"] {
+            let db = db_with("k", "v");
+            assert_eq!(err_msg(exec(&db, &table, &format!("EXPIRE k 100 {combo}"))), nx_xx_msg);
+            assert_eq!(db.ttl(b"k"), -1, "combo {combo} must not touch the key");
+        }
+        let db = db_with("k", "v");
+        assert_eq!(
+            err_msg(exec(&db, &table, "EXPIRE k 100 GT LT")),
+            "ERR GT and LT options at the same time are not compatible"
+        );
+        // XX + LT 是合法组合：无 TTL 的键因 XX 不满足而失败。
+        let db = db_with("k", "v");
+        assert_eq!(exec(&db, &table, "EXPIRE k 100 XX LT"), RespValue::Integer(0));
+    }
+
+    #[test]
+    fn test_expire_overflow_reports_invalid_expire_time() {
+        let table = table();
+        let db = db_with("k", "v");
+        assert_eq!(
+            err_msg(exec(&db, &table, "EXPIRE k 9223372036854775807")),
+            "ERR invalid expire time in 'expire' command"
+        );
+        assert_eq!(
+            err_msg(exec(&db, &table, "EXPIRE missing 9223372036854775807")),
+            "ERR invalid expire time in 'expire' command"
+        );
+    }
+
+    #[test]
+    fn test_conditional_options() {
+        let table = table();
+        let plain = || db_with("k", "v");
+
+        // NX：已有过期时间则失败
+        let db = plain();
+        exec(&db, &table, "EXPIRE k 100");
+        assert_eq!(exec(&db, &table, "EXPIRE k 200 NX"), RespValue::Integer(0));
+        // XX：无过期时间则失败
+        let db = plain();
+        assert_eq!(exec(&db, &table, "EXPIRE k 200 XX"), RespValue::Integer(0));
+        assert_eq!(db.ttl(b"k"), -1);
+        // GT：更短的新值被拒
+        let db = plain();
+        exec(&db, &table, "EXPIRE k 100");
+        assert_eq!(exec(&db, &table, "EXPIRE k 50 GT"), RespValue::Integer(0));
+        assert_eq!(exec(&db, &table, "EXPIRE k 500 GT"), RespValue::Integer(1));
+        // LT：更长的新值被拒
+        let db = plain();
+        exec(&db, &table, "EXPIRE k 500");
+        assert_eq!(exec(&db, &table, "EXPIRE k 100 LT"), RespValue::Integer(1));
+        assert_eq!(exec(&db, &table, "EXPIRE k 900 LT"), RespValue::Integer(0));
+    }
+
+    #[test]
+    fn test_expire_gt_lt_against_key_without_ttl() {
+        let table = table();
+        // 无 TTL 时 GT 没有可比较的基准值，因此失败；LT 视当前为无穷大，因此成功。
+        let db = db_with("k", "v");
+        assert_eq!(exec(&db, &table, "EXPIRE k 100 GT"), RespValue::Integer(0));
+        assert_eq!(db.ttl(b"k"), -1);
+        assert_eq!(exec(&db, &table, "EXPIRE k 100 LT"), RespValue::Integer(1));
+        assert!(db.ttl(b"k") > 0);
+    }
+
+    #[test]
+    fn test_expire_arity_accepts_options() {
+        let db = db_with("k", "v");
+        let v = exec(&db, &table(), "EXPIRE k 100 NX");
+        assert_ne!(v, RespValue::err("ERR wrong number of arguments"));
+        assert_eq!(v, RespValue::Integer(1));
+    }
+
+    #[test]
+    fn test_getex_sets_ttl() {
+        let table = table();
+        let db = db_with("k", "v");
+        assert_eq!(
+            exec(&db, &table, "GETEX k EX 100"),
+            RespValue::BulkString(b"v".to_vec())
+        );
+        assert!((99..=100).contains(&db.ttl(b"k")));
+    }
+
+    #[test]
+    fn test_getex_without_option_keeps_ttl() {
+        let table = table();
+        let db = Database::new(0);
+        db.set(b"k", RedisObject::String(b"v".to_vec()), Some(100_000));
+        assert_eq!(exec(&db, &table, "GETEX k"), RespValue::BulkString(b"v".to_vec()));
+        assert!(db.ttl(b"k") > 0);
+    }
+
+    #[test]
+    fn test_getex_persist_and_invalid_deadline() {
+        let table = table();
+        let db = Database::new(0);
+        db.set(b"k", RedisObject::String(b"v".to_vec()), Some(100_000));
+        assert_eq!(exec(&db, &table, "GETEX k PERSIST"), RespValue::BulkString(b"v".to_vec()));
+        assert_eq!(db.ttl(b"k"), -1);
+
+        // GETEX 不像 EXPIRE 那样删除键：已过期的时间点属于参数非法。
+        db.set(b"k2", RedisObject::String(b"v".to_vec()), None);
+        assert_eq!(
+            err_msg(exec(&db, &table, "GETEX k2 EX 0")),
+            "ERR invalid expire time in 'getex' command"
+        );
+        assert!(db.exists(b"k2"));
+        assert_eq!(db.ttl(b"k2"), -1);
+
+        // 关键字错误先于键存在性检查，数值错误则相反。
+        assert_eq!(
+            err_msg(exec(&db, &table, "GETEX nope EX 100 PERSIST")),
+            "ERR syntax error"
+        );
+        assert_eq!(exec(&db, &table, "GETEX nope EX abc"), RespValue::Null);
+        // 同一选项重复出现时后者生效。
+        assert_eq!(
+            exec(&db, &table, "GETEX k2 EX 100 EX 200"),
+            RespValue::BulkString(b"v".to_vec())
+        );
+        assert!((199..=200).contains(&db.ttl(b"k2")));
+    }
+
+    #[test]
+    fn test_set_expiry_arguments() {
+        let table = table();
+        let db = Database::new(0);
+        assert_eq!(
+            err_msg(exec(&db, &table, "SETEX s abc v")),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            err_msg(exec(&db, &table, "SETEX s 0 v")),
+            "ERR invalid expire time in 'setex' command"
+        );
+        // 秒数换算成毫秒会溢出，同样按非法时间点报错。
+        assert_eq!(
+            err_msg(exec(&db, &table, "SETEX s 9223372036854775807 v")),
+            "ERR invalid expire time in 'setex' command"
+        );
+        assert!(!db.exists(b"s"));
+        assert_eq!(exec(&db, &table, "SETEX s 100 v"), RespValue::ok());
+        assert_eq!(db.ttl(b"s"), 100);
+
+        assert_eq!(err_msg(exec(&db, &table, "SET s2 v FOO")), "ERR syntax error");
+        assert_eq!(err_msg(exec(&db, &table, "SET s2 v EX")), "ERR syntax error");
+        assert_eq!(
+            err_msg(exec(&db, &table, "SET s2 v EX 0")),
+            "ERR invalid expire time in 'set' command"
+        );
+        assert_eq!(err_msg(exec(&db, &table, "SET s2 v NX XX")), "ERR syntax error");
+
+        // 绝对时刻已在过去：键被删除并回复 OK，新值不写入。
+        exec(&db, &table, "SET s3 v");
+        assert_eq!(exec(&db, &table, "SET s3 v2 EXAT 100"), RespValue::ok());
+        assert!(!db.exists(b"s3"));
+    }
+
+    #[test]
+    fn test_lmove_argument_positions() {
+        let db = Database::new(0);
+        let table = table();
+        exec(&db, &table, "RPUSH A x y");
+        exec(&db, &table, "RPUSH B p");
+        assert_eq!(
+            exec(&db, &table, "LMOVE A B LEFT RIGHT"),
+            RespValue::BulkString(b"x".to_vec())
+        );
+        assert_eq!(list_of(&db, b"A"), vec!["y"]);
+        assert_eq!(list_of(&db, b"B"), vec!["p", "x"]);
+        // 方向字面量不应被当成目标键
+        assert!(!db.exists(b"LEFT"));
+        assert!(!db.exists(b"RIGHT"));
+
+        assert_eq!(
+            exec(&db, &table, "LMOVE B A RIGHT LEFT"),
+            RespValue::BulkString(b"x".to_vec())
+        );
+        assert_eq!(list_of(&db, b"B"), vec!["p"]);
+        assert_eq!(list_of(&db, b"A"), vec!["x", "y"]);
+
+        assert_eq!(err_msg(exec(&db, &table, "LMOVE A B UP RIGHT")), "ERR syntax error");
+        assert_eq!(err_msg(exec(&db, &table, "LMOVE A B LEFT DOWN")), "ERR syntax error");
+        assert_eq!(
+            exec(&db, &table, "LMOVE A B left right"),
+            RespValue::BulkString(b"x".to_vec())
+        );
+        assert_eq!(exec(&db, &table, "LMOVE nope B LEFT RIGHT"), RespValue::Null);
+    }
+
+    #[test]
+    fn test_list_move_rejects_wrongtype_without_losing_data() {
+        let db = Database::new(0);
+        let table = table();
+        exec(&db, &table, "RPUSH A x y");
+        exec(&db, &table, "SET s v");
+        for line in ["LMOVE A s LEFT RIGHT", "RPOPLPUSH A s"] {
+            assert_eq!(
+                err_msg(exec(&db, &table, line)),
+                "WRONGTYPE Operation against a key holding the wrong kind of value",
+                "{line}"
+            );
+            assert_eq!(list_of(&db, b"A"), vec!["x", "y"], "{line}");
+        }
+    }
+
+    #[test]
+    fn test_blmove_validates_then_moves() {
+        let db = Database::new(0);
+        let table = table();
+        exec(&db, &table, "RPUSH A x y");
+        exec(&db, &table, "RPUSH B p");
+        assert_eq!(
+            err_msg(exec(&db, &table, "BLMOVE A B LEFT RIGHT abc")),
+            "ERR timeout is not a float or out of range"
+        );
+        assert_eq!(
+            err_msg(exec(&db, &table, "BLMOVE A B LEFT RIGHT inf")),
+            "ERR timeout is out of range"
+        );
+        assert_eq!(
+            err_msg(exec(&db, &table, "BLMOVE A B LEFT RIGHT -1")),
+            "ERR timeout is negative"
+        );
+        assert_eq!(
+            err_msg(exec(&db, &table, "BLMOVE A B UP RIGHT 0")),
+            "ERR syntax error"
+        );
+        assert_eq!(list_of(&db, b"A"), vec!["x", "y"]);
+
+        assert_eq!(
+            exec(&db, &table, "BLMOVE A B LEFT RIGHT 0"),
+            RespValue::BulkString(b"x".to_vec())
+        );
+        assert_eq!(list_of(&db, b"A"), vec!["y"]);
+        assert_eq!(list_of(&db, b"B"), vec!["p", "x"]);
+    }
+
+    #[test]
+    fn test_xlen_arity_is_two() {
+        let db = Database::new(0);
+        let table = table();
+        exec(&db, &table, "XADD s 1-1 f v");
+        assert_eq!(exec(&db, &table, "XLEN s"), RespValue::Integer(1));
+    }
+
+    #[test]
+    fn test_xtrim_exact_and_approximate() {
+        let db = Database::new(0);
+        let table = table();
+        for id in 1..=4 {
+            exec(&db, &table, &format!("XADD s {id}-0 f v"));
+        }
+        // 近似裁剪只会比精确裁剪删得更少：4 条都在同一个节点内，什么都不删。
+        assert_eq!(
+            exec(&db, &table, "XTRIM s MAXLEN ~ 2"),
+            RespValue::Integer(0)
+        );
+        assert_eq!(exec(&db, &table, "XLEN s"), RespValue::Integer(4));
+        assert_eq!(
+            exec(&db, &table, "XTRIM s MAXLEN 2"),
+            RespValue::Integer(2)
+        );
+        assert_eq!(exec(&db, &table, "XLEN s"), RespValue::Integer(2));
+
+        // 超过一个节点（100 条）后才按整节点丢弃。
+        for id in 1..=250 {
+            exec(&db, &table, &format!("XADD big {id}-0 f v"));
+        }
+        assert_eq!(
+            exec(&db, &table, "XTRIM big MAXLEN ~ 2"),
+            RespValue::Integer(200)
+        );
+        assert_eq!(exec(&db, &table, "XLEN big"), RespValue::Integer(50));
+        assert_eq!(
+            exec(&db, &table, "XTRIM big MAXLEN ~ 0"),
+            RespValue::Integer(50)
+        );
+        assert_eq!(exec(&db, &table, "XLEN big"), RespValue::Integer(0));
+
+        assert_eq!(
+            exec(&db, &table, "XTRIM s MINID 3-0"),
+            RespValue::Integer(0)
+        );
+        exec(&db, &table, "XADD s 5-0 f v");
+        assert_eq!(
+            exec(&db, &table, "XTRIM s MINID 5-0"),
+            RespValue::Integer(2)
+        );
+        assert_eq!(exec(&db, &table, "XLEN s"), RespValue::Integer(1));
+        assert_eq!(exec(&db, &table, "XTRIM nosuch MAXLEN 1"), RespValue::Integer(0));
+        assert_eq!(
+            err_msg(exec(&db, &table, "XTRIM s MAXLEN abc")),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(
+            err_msg(exec(&db, &table, "XTRIM s MAXLEN -1")),
+            "ERR The MAXLEN argument must be >= 0."
+        );
+        assert_eq!(
+            err_msg(exec(&db, &table, "XTRIM s MAXLEN ~")),
+            "ERR value is not an integer or out of range"
+        );
+        assert_eq!(err_msg(exec(&db, &table, "XTRIM s FOO 1")), "ERR syntax error");
+        assert_eq!(
+            err_msg(exec(&db, &table, "XTRIM s MAXLEN 1 extra")),
+            "ERR syntax error"
+        );
+        assert_eq!(
+            err_msg(exec(&db, &table, "XTRIM s MINID nonsense")),
+            "ERR Invalid stream ID specified as stream command argument"
+        );
+    }
+
+    #[test]
+    fn test_xadd_trim_options() {
+        let db = Database::new(0);
+        let table = table();
+        // `~` 不能再把 ID 挤到错误的位置上。
+        exec(&db, &table, "XADD s MAXLEN ~ 1 1-0 f v");
+        exec(&db, &table, "XADD s MAXLEN ~ 1 2-0 f v");
+        assert_eq!(exec(&db, &table, "XLEN s"), RespValue::Integer(2));
+        exec(&db, &table, "XADD s MAXLEN 1 3-0 f v");
+        assert_eq!(exec(&db, &table, "XLEN s"), RespValue::Integer(1));
+        assert_eq!(
+            err_msg(exec(&db, &table, "XADD s MAXLEN 1 nonsense f v")),
+            "ERR Invalid stream ID specified as stream command argument"
+        );
+
+        // XADD ... MINID 在写入后立即丢弃更旧的消息。
+        exec(&db, &table, "XADD m MINID 2-0 1-0 f v");
+        assert_eq!(exec(&db, &table, "XLEN m"), RespValue::Integer(0));
+        exec(&db, &table, "XADD m MINID 2-0 3-0 f v");
+        assert_eq!(exec(&db, &table, "XLEN m"), RespValue::Integer(1));
+
+        // NOMKSTREAM：键不存在时不创建，回复 nil。
+        assert_eq!(exec(&db, &table, "XADD nk NOMKSTREAM * f v"), RespValue::Null);
+        assert!(!db.exists(b"nk"));
+        exec(&db, &table, "XADD nk 1-0 f v");
+        exec(&db, &table, "XADD nk NOMKSTREAM 2-0 f v");
+        assert_eq!(exec(&db, &table, "XLEN nk"), RespValue::Integer(2));
+    }
+
+    /// 取出列表键的内容，便于断言。
+    fn list_of(db: &Database, key: &[u8]) -> Vec<String> {
+        match db.get(key) {
+            Some(RedisObject::List(l)) => l
+                .iter()
+                .map(|v| String::from_utf8_lossy(v).into_owned())
+                .collect(),
+            other => panic!("expected list, got {other:?}"),
+        }
+    }
 }

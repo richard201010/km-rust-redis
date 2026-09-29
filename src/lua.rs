@@ -44,6 +44,21 @@ impl LuaEngine {
         self.scripts.lock().unwrap().get(sha).cloned()
     }
 
+    /// 脚本缓存中是否已存在该 SHA1（对应 `SCRIPT EXISTS`）。
+    pub fn has_script(&self, sha: &str) -> bool {
+        self.scripts.lock().unwrap().contains_key(sha)
+    }
+
+    /// 清空脚本缓存（对应 `SCRIPT FLUSH`）。
+    pub fn flush_scripts(&self) {
+        self.scripts.lock().unwrap().clear();
+    }
+
+    /// 缓存里已缓存的脚本数量（对应 `SCRIPT HELP`/调试用途）。
+    pub fn cached_script_count(&self) -> usize {
+        self.scripts.lock().unwrap().len()
+    }
+
     pub fn eval_script(&self, script: &str, keys: &[Vec<u8>], argv: &[Vec<u8>], db: &Database) -> RespValue {
         self.execute_lua(script, keys, argv, db)
     }
