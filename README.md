@@ -100,11 +100,7 @@ LRANGE_100   131K rps     230K rps    176%    🚀 大幅超越
 | Modules 模块 | ✅ | 动态加载 .so/.dylib |
 
 ---
-
-## 架构设计
-
-> 详细算法解析见 [docs/ALGORITHM.md](docs/ALGORITHM.md)
-
+ 
 
 ### 逻辑架构图
 
